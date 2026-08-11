@@ -245,39 +245,20 @@ def cover_url(book):
     return f"/cover/{book['id']}/cover.jpg"
 
 
-# ── Cover serving ──────────────────────────────────────────────────────────────
-
-from fastapi.responses import FileResponse, Response
-
-LIBRARY_PATH = Path("/calibre")
-
-@app.get("/cover/{book_id}/{filename}")
-async def cover(book_id: int, filename: str):
-    # Calibre stores cover.jpg inside the book's path folder
-    for b in STATE.books:
-        if b["id"] == book_id:
-            cover_path = LIBRARY_PATH / b["path"] / "cover.jpg"
-            if cover_path.exists():
-                return FileResponse(str(cover_path))
-            break
-    return Response(status_code=404)
-
-
 def candidate_pool(likes, dislikes, seen, limit=30):
-    if not likes:
-        # cold start: prefer single books with good metadata, not omnibuses
-        pool = []
-        for b in STATE.books:
-            if b["id"] in dislikes or b["id"] in seen or not b.get("description"):
-                continue
-            if "omnibus" in b["title"].lower() or "complete" in b["title"].lower() or "collection" in b["title"].lower():
-                continue
-            pool.append(b)
-        # sort by description length + tag count, take top, then shuffle for variety
-        pool.sort(key=lambda x: len(x.get("description", "")) + len(x.get("tags", [])) * 50, reverse=True)
-        pool = pool[:limit * 2]
-        np.random.shuffle(pool)
-        return pool[:limit]
+    # cold start: prefer single books with good metadata, not omnibuses
+    pool = []
+    for b in STATE.books:
+        if b["id"] in dislikes or b["id"] in seen or not b.get("description"):
+            continue
+        if "omnibus" in b["title"].lower() or "complete" in b["title"].lower() or "collection" in b["title"].lower():
+            continue
+        pool.append(b)
+    # sort by description length + tag count, take top, then shuffle for variety
+    pool.sort(key=lambda x: len(x.get("description", "")) + len(x.get("tags", [])) * 50, reverse=True)
+    pool = pool[:limit * 2]
+    np.random.shuffle(pool)
+    return pool[:limit]
 
     liked_vectors = []
     liked_indices = []
@@ -425,3 +406,21 @@ async def stats():
 async def rebuild_index():
     ensure_index()
     return {"ok": True, "count": len(STATE.books)}
+
+
+# ── Cover serving ────────────────────────────────────────────────────────────
+
+from fastapi.responses import FileResponse, Response
+
+LIBRARY_PATH = Path("/calibre")
+
+@app.get("/cover/{book_id}/{filename}")
+async def cover(book_id: int, filename: str):
+    # Calibre stores cover.jpg inside the book's path folder
+    for b in STATE.books:
+        if b["id"] == book_id:
+            cover_path = LIBRARY_PATH / b["path"] / "cover.jpg"
+            if cover_path.exists():
+                return FileResponse(str(cover_path))
+            break
+    return Response(status_code=404)
