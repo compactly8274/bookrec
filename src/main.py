@@ -242,20 +242,41 @@ def ensure_index():
 def cover_url(book):
     if not book.get("has_cover"):
         return ""
-    # Calibre-Web cover path pattern
-    title_slug = re.sub(r"[^a-zA-Z0-9]+", " ", book["title"]).strip().replace(" ", "_")
-    author_slug = re.sub(r"[^a-zA-Z0-9]+", " ", book.get("author_sort") or "").strip().replace(" ", "_")
-    return f"/cover/{book['id']}/{title_slug}_{author_slug}.jpg"
+    return f"/cover/{book['id']}/cover.jpg"
+
+
+# ── Cover serving ──────────────────────────────────────────────────────────────
+
+from fastapi.responses import FileResponse, Response
+
+LIBRARY_PATH = Path("/calibre")
+
+@app.get("/cover/{book_id}/{filename}")
+async def cover(book_id: int, filename: str):
+    # Calibre stores cover.jpg inside the book's path folder
+    for b in STATE.books:
+        if b["id"] == book_id:
+            cover_path = LIBRARY_PATH / b["path"] / "cover.jpg"
+            if cover_path.exists():
+                return FileResponse(str(cover_path))
+            break
+    return Response(status_code=404)
 
 
 def candidate_pool(likes, dislikes, seen, limit=30):
     if not likes:
-        # cold start: randomish diverse books not seen
+        # cold start: prefer single books with good metadata, not omnibuses
         pool = []
         for b in STATE.books:
-            if b["id"] not in dislikes and b["id"] not in seen and b.get("description"):
-                pool.append(b)
-        pool.sort(key=lambda x: len(x.get("tags", [])), reverse=True)
+            if b["id"] in dislikes or b["id"] in seen or not b.get("description"):
+                continue
+            if "omnibus" in b["title"].lower() or "complete" in b["title"].lower() or "collection" in b["title"].lower():
+                continue
+            pool.append(b)
+        # sort by description length + tag count, take top, then shuffle for variety
+        pool.sort(key=lambda x: len(x.get("description", "")) + len(x.get("tags", [])) * 50, reverse=True)
+        pool = pool[:limit * 2]
+        np.random.shuffle(pool)
         return pool[:limit]
 
     liked_vectors = []
@@ -379,7 +400,18 @@ async def recommend():
 
 @app.post("/api/feedback")
 async def feedback(fb: Feedback):
-    record_feedback(fb)
+    if fb.action == "more":
+        # treat "more" as a like for recommendation seeding, but only record a "more" event
+        conn = sqlite3.connect(str(DB_PATH))
+        cur = conn.cursor()
+        cur.execute("INSERT OR REPLACE INTO likes (book_id) VALUES (?)", (fb.book_id,))
+        cur.execute("DELETE FROM dislikes WHERE book_id=?", (fb.book_id,))
+        cur.execute("INSERT OR REPLACE INTO seen (book_id) VALUES (?)", (fb.book_id,))
+        cur.execute("INSERT INTO feedback (book_id, action, reason_shown) VALUES (?, ?, ?)", (fb.book_id, "more", fb.reason_shown))
+        conn.commit()
+        conn.close()
+    else:
+        record_feedback(fb)
     return {"ok": True}
 
 
