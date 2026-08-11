@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 ARG UID=99
-ARG GID=100
+ARG GID=1000
 
 WORKDIR /app
 
