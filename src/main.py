@@ -102,6 +102,9 @@ class AppState:
         self.db_ready = False
 
 
+STATE = AppState()
+
+
 # ── Caches ────────────────────────────────────────────────────────────────────
 
 # reason cache: (book_id, like_signature) -> reason string.
