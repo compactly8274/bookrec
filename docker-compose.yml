@@ -1,0 +1,18 @@
+services:
+  bookrec:
+    image: ghcr.io/compactly8274/bookrec:latest
+    container_name: bookrec
+    restart: unless-stopped
+    ports:
+      - "8484:8000"
+    environment:
+      # Ollama endpoint for LLM-generated reasons. Leave empty to disable LLM.
+      OLLAMA_URL: "http://192.168.1.104:11434"
+      OLLAMA_MODEL: "gemma3:4b"
+    volumes:
+      - /mnt/user/Books:/calibre:ro
+      - /mnt/user/appdata/bookrec:/config
+    deploy:
+      resources:
+        limits:
+          memory: 1G

@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.env
+.venv/
+/config/
+/data/
+/calibre/
+*.faiss
+*.json
+.DS_Store
