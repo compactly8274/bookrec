@@ -102,7 +102,13 @@ class AppState:
         self.db_ready = False
 
 
-STATE = AppState()
+# ── Caches ────────────────────────────────────────────────────────────────────
+
+# reason cache: (book_id, like_signature) -> reason string.
+# invalidate on every write to likes/dislikes.
+REASON_CACHE: dict = {}
+LIKE_SIG: tuple = ()
+STATE_CACHE: dict = {}  # {"likes":..., "dislikes":..., "seen":..., "loaded":False}
 INDEX_LOCK = asyncio.Lock()
 REBUILD_LOCK = asyncio.Lock()
 DB_LOCK = asyncio.Lock()
@@ -155,6 +161,8 @@ def init_db():
 
 
 async def load_state_from_db():
+    if STATE_CACHE.get("loaded"):
+        return STATE_CACHE["likes"], STATE_CACHE["dislikes"], STATE_CACHE["seen"]
     async with DB_LOCK:
         conn = sqlite3.connect(str(DB_PATH))
         cur = conn.cursor()
@@ -165,7 +173,11 @@ async def load_state_from_db():
         cur.execute("SELECT book_id FROM seen")
         seen = {r[0] for r in cur.fetchall()}
         conn.close()
-        return likes, dislikes, seen
+    STATE_CACHE["likes"] = likes
+    STATE_CACHE["dislikes"] = dislikes
+    STATE_CACHE["seen"] = seen
+    STATE_CACHE["loaded"] = True
+    return likes, dislikes, seen
 
 
 async def record_feedback(fb: Feedback):
@@ -186,6 +198,17 @@ async def record_feedback(fb: Feedback):
         cur.execute("INSERT OR REPLACE INTO seen (book_id) VALUES (?)", (fb.book_id,))
         conn.commit()
         conn.close()
+    # in-memory caches: update immediately so the next request sees the new state
+    if STATE_CACHE.get("loaded"):
+        STATE_CACHE["likes"].discard(fb.book_id)
+        STATE_CACHE["dislikes"].discard(fb.book_id)
+        STATE_CACHE["seen"].add(fb.book_id)
+        if fb.action == "like":
+            STATE_CACHE["likes"].add(fb.book_id)
+        elif fb.action == "dislike":
+            STATE_CACHE["dislikes"].add(fb.book_id)
+    # reasons depend on the user's likes signature — invalidate on any like change
+    REASON_CACHE.clear()
 
 
 # ── Indexing ─────────────────────────────────────────────────────────────────
@@ -215,6 +238,9 @@ def build_index():
     STATE.books = books
     STATE.book_ids = [b["id"] for b in books]
     STATE.id_to_idx = {bid: i for i, bid in enumerate(STATE.book_ids)}
+    # book list changed: any in-memory state referencing old ids is stale
+    STATE_CACHE.clear()
+    REASON_CACHE.clear()
     logger.info("Index built: %d books", len(books))
 
 
@@ -222,7 +248,9 @@ def load_index():
     if not INDEX_PATH.exists() or not (CONFIG_DIR / "books.json").exists():
         return False
     logger.info("Loading existing index...")
-    STATE.model = SentenceTransformer(MODEL_NAME)
+    # only instantiate the model once; reuse across reloads
+    if STATE.model is None:
+        STATE.model = SentenceTransformer(MODEL_NAME)
     STATE.index = faiss.read_index(str(INDEX_PATH))
     STATE.books = json.loads((CONFIG_DIR / "books.json").read_text(encoding="utf-8"))
     STATE.book_ids = [b["id"] for b in STATE.books]
@@ -298,9 +326,12 @@ def candidate_pool(likes, dislikes, seen, limit=30):
     return pool
 
 
-async def llm_reason(book, liked_titles):
+async def llm_reason(book, liked_titles, like_sig):
     if not OLLAMA_URL:
         return ""
+    cache_key = (book["id"], like_sig)
+    if cache_key in REASON_CACHE:
+        return REASON_CACHE[cache_key]
     prompt = f"""The user likes these books: {liked_titles}.
 Recommend the book "{book['title']}" by {', '.join(book.get('authors', [])) or 'unknown'} in one short sentence (under 25 words). Mention a specific theme, style, or mood that connects it to what they like. Keep it casual."""
     try:
@@ -311,10 +342,13 @@ Recommend the book "{book['title']}" by {', '.join(book.get('authors', [])) or '
             )
             r.raise_for_status()
             data = r.json()
-            return data.get("response", "").strip()
+            reason = data.get("response", "").strip()
     except Exception as e:
         logger.debug("LLM reason failed: %s", e)
         return ""
+    if reason:
+        REASON_CACHE[cache_key] = reason
+    return reason
 
 
 def deterministic_reason(book, liked_titles):
@@ -330,7 +364,6 @@ async def next_recommendation():
     pool = candidate_pool(likes, dislikes, seen, limit=30)
     if not pool:
         return None
-    # pick first unseen candidate (already filtered)
     book = pool[0]
     liked_titles = []
     for bid in list(likes)[:3]:
@@ -338,12 +371,30 @@ async def next_recommendation():
         if idx is not None:
             liked_titles.append(STATE.books[idx]["title"])
 
-    reason = await llm_reason(book, liked_titles)
+    # signature of current like set, used to memoize LLM reasons
+    like_sig = tuple(sorted(likes))
+
+    reason = await llm_reason(book, liked_titles, like_sig)
     if not reason:
         reason = deterministic_reason(book, liked_titles)
 
     book["reason"] = reason
     book["cover_url"] = cover_url(book)
+
+    # mark as seen so a card that the user just looks at but doesn't click
+    # won't resurface on the next /api/recommend
+    bid = book["id"]
+    if bid not in seen and bid not in likes and bid not in dislikes:
+        async with DB_LOCK:
+            conn = sqlite3.connect(str(DB_PATH))
+            cur = conn.cursor()
+            cur.execute("INSERT OR REPLACE INTO seen (book_id) VALUES (?)", (bid,))
+            conn.commit()
+            conn.close()
+        seen.add(bid)
+        if STATE_CACHE.get("loaded"):
+            STATE_CACHE["seen"].add(bid)
+
     return book
 
 

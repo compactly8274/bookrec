@@ -54,6 +54,9 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            UID=99
+            GID=100
 
       - name: Attest
         uses: actions/attest-build-provenance@v1
