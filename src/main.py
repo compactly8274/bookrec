@@ -1,19 +1,15 @@
 from pathlib import Path
 import sqlite3
 import json
-import re
-import hashlib
-import time
-import asyncio
 import logging
 import os
+import asyncio
 from contextlib import asynccontextmanager
 from typing import Optional
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, FileResponse, Response
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
@@ -107,12 +103,18 @@ class AppState:
 
 
 STATE = AppState()
+INDEX_LOCK = asyncio.Lock()
+REBUILD_LOCK = asyncio.Lock()
+DB_LOCK = asyncio.Lock()
 
 
 def init_db():
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH))
     cur = conn.cursor()
+    cur.execute("PRAGMA journal_mode=WAL")
+    cur.execute("PRAGMA synchronous=NORMAL")
+    cur.execute("PRAGMA busy_timeout=5000")
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS feedback (
@@ -152,35 +154,38 @@ def init_db():
     conn.close()
 
 
-def load_state_from_db():
-    conn = sqlite3.connect(str(DB_PATH))
-    cur = conn.cursor()
-    cur.execute("SELECT book_id FROM likes")
-    likes = {r[0] for r in cur.fetchall()}
-    cur.execute("SELECT book_id FROM dislikes")
-    dislikes = {r[0] for r in cur.fetchall()}
-    cur.execute("SELECT book_id FROM seen")
-    seen = {r[0] for r in cur.fetchall()}
-    conn.close()
-    return likes, dislikes, seen
+async def load_state_from_db():
+    async with DB_LOCK:
+        conn = sqlite3.connect(str(DB_PATH))
+        cur = conn.cursor()
+        cur.execute("SELECT book_id FROM likes")
+        likes = {r[0] for r in cur.fetchall()}
+        cur.execute("SELECT book_id FROM dislikes")
+        dislikes = {r[0] for r in cur.fetchall()}
+        cur.execute("SELECT book_id FROM seen")
+        seen = {r[0] for r in cur.fetchall()}
+        conn.close()
+        return likes, dislikes, seen
 
 
-def record_feedback(fb: Feedback):
-    conn = sqlite3.connect(str(DB_PATH))
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO feedback (book_id, action, reason_shown) VALUES (?, ?, ?)",
-        (fb.book_id, fb.action, fb.reason_shown),
-    )
-    if fb.action == "like":
-        cur.execute("INSERT OR REPLACE INTO likes (book_id) VALUES (?)", (fb.book_id,))
-        cur.execute("DELETE FROM dislikes WHERE book_id=?", (fb.book_id,))
-    elif fb.action == "dislike":
-        cur.execute("INSERT OR REPLACE INTO dislikes (book_id) VALUES (?)", (fb.book_id,))
-        cur.execute("DELETE FROM likes WHERE book_id=?", (fb.book_id,))
-    cur.execute("INSERT OR REPLACE INTO seen (book_id) VALUES (?)", (fb.book_id,))
-    conn.commit()
-    conn.close()
+async def record_feedback(fb: Feedback):
+    async with DB_LOCK:
+        conn = sqlite3.connect(str(DB_PATH))
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO feedback (book_id, action, reason_shown) VALUES (?, ?, ?)",
+            (fb.book_id, fb.action, fb.reason_shown),
+        )
+        if fb.action == "like":
+            cur.execute("INSERT OR REPLACE INTO likes (book_id) VALUES (?)", (fb.book_id,))
+            cur.execute("DELETE FROM dislikes WHERE book_id=?", (fb.book_id,))
+        elif fb.action == "dislike":
+            cur.execute("INSERT OR REPLACE INTO dislikes (book_id) VALUES (?)", (fb.book_id,))
+            cur.execute("DELETE FROM likes WHERE book_id=?", (fb.book_id,))
+        # mark seen for any action so a liked/disliked book won't resurface
+        cur.execute("INSERT OR REPLACE INTO seen (book_id) VALUES (?)", (fb.book_id,))
+        conn.commit()
+        conn.close()
 
 
 # ── Indexing ─────────────────────────────────────────────────────────────────
@@ -246,21 +251,21 @@ def cover_url(book):
 
 
 def candidate_pool(likes, dislikes, seen, limit=30):
-    # cold start: prefer single books with good metadata, not omnibuses
-    pool = []
-    for b in STATE.books:
-        if b["id"] in dislikes or b["id"] in seen or not b.get("description"):
-            continue
-        if "omnibus" in b["title"].lower() or "complete" in b["title"].lower() or "collection" in b["title"].lower():
-            continue
-        pool.append(b)
-    # sort by description length + tag count, take top, then shuffle for variety
-    pool.sort(key=lambda x: len(x.get("description", "")) + len(x.get("tags", [])) * 50, reverse=True)
-    pool = pool[:limit * 2]
-    np.random.shuffle(pool)
-    return pool[:limit]
+    if not likes:
+        # cold start: prefer single books with good metadata, not omnibuses
+        pool = []
+        for b in STATE.books:
+            if b["id"] in dislikes or b["id"] in seen or not b.get("description"):
+                continue
+            if "omnibus" in b["title"].lower() or "complete" in b["title"].lower() or "collection" in b["title"].lower():
+                continue
+            pool.append(b)
+        pool.sort(key=lambda x: len(x.get("description", "")) + len(x.get("tags", [])) * 50, reverse=True)
+        pool = pool[:limit * 2]
+        np.random.shuffle(pool)
+        return pool[:limit]
 
-    liked_vectors = []
+    # personalised: nearest neighbour over the user's likes
     liked_indices = []
     for bid in likes:
         idx = STATE.id_to_idx.get(bid)
@@ -321,7 +326,7 @@ def deterministic_reason(book, liked_titles):
 
 
 async def next_recommendation():
-    likes, dislikes, seen = load_state_from_db()
+    likes, dislikes, seen = await load_state_from_db()
     pool = candidate_pool(likes, dislikes, seen, limit=30)
     if not pool:
         return None
@@ -382,45 +387,59 @@ async def recommend():
 @app.post("/api/feedback")
 async def feedback(fb: Feedback):
     if fb.action == "more":
-        # treat "more" as a like for recommendation seeding, but only record a "more" event
-        conn = sqlite3.connect(str(DB_PATH))
-        cur = conn.cursor()
-        cur.execute("INSERT OR REPLACE INTO likes (book_id) VALUES (?)", (fb.book_id,))
-        cur.execute("DELETE FROM dislikes WHERE book_id=?", (fb.book_id,))
-        cur.execute("INSERT OR REPLACE INTO seen (book_id) VALUES (?)", (fb.book_id,))
-        cur.execute("INSERT INTO feedback (book_id, action, reason_shown) VALUES (?, ?, ?)", (fb.book_id, "more", fb.reason_shown))
-        conn.commit()
-        conn.close()
+        # "more like this" both seeds the recommender (as a like) and records the "more" event
+        fb_like = Feedback(book_id=fb.book_id, action="like", reason_shown=fb.reason_shown)
+        await record_feedback(fb_like)
+        async with DB_LOCK:
+            conn = sqlite3.connect(str(DB_PATH))
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO feedback (book_id, action, reason_shown) VALUES (?, ?, ?)",
+                (fb.book_id, "more", fb.reason_shown),
+            )
+            conn.commit()
+            conn.close()
     else:
-        record_feedback(fb)
+        await record_feedback(fb)
     return {"ok": True}
 
 
 @app.get("/api/stats")
 async def stats():
-    likes, dislikes, seen = load_state_from_db()
+    likes, dislikes, seen = await load_state_from_db()
     return {"total": len(STATE.books), "liked": len(likes), "disliked": len(dislikes), "seen": len(seen)}
 
 
 @app.get("/api/rebuild")
 async def rebuild_index():
-    ensure_index()
+    async with REBUILD_LOCK:
+        await asyncio.to_thread(ensure_index)
     return {"ok": True, "count": len(STATE.books)}
 
 
 # ── Cover serving ────────────────────────────────────────────────────────────
 
-from fastapi.responses import FileResponse, Response
+LIBRARY_PATH = Path("/calibre").resolve()
 
-LIBRARY_PATH = Path("/calibre")
 
 @app.get("/cover/{book_id}/{filename}")
 async def cover(book_id: int, filename: str):
-    # Calibre stores cover.jpg inside the book's path folder
+    # Calibre stores cover.jpg inside the book's path folder.
+    # Reject any book whose resolved path escapes the library root.
     for b in STATE.books:
         if b["id"] == book_id:
-            cover_path = LIBRARY_PATH / b["path"] / "cover.jpg"
-            if cover_path.exists():
+            book_dir = (LIBRARY_PATH / b["path"]).resolve()
+            try:
+                book_dir.relative_to(LIBRARY_PATH)
+            except ValueError:
+                return Response(status_code=400)
+            cover_path = book_dir / filename
+            # ensure the final resolved path is still under the book dir
+            try:
+                cover_path.resolve().relative_to(book_dir)
+            except ValueError:
+                return Response(status_code=400)
+            if cover_path.is_file():
                 return FileResponse(str(cover_path))
             break
     return Response(status_code=404)
