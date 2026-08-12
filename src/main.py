@@ -120,47 +120,49 @@ DB_LOCK = asyncio.Lock()
 def init_db():
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH))
-    cur = conn.cursor()
-    cur.execute("PRAGMA journal_mode=WAL")
-    cur.execute("PRAGMA synchronous=NORMAL")
-    cur.execute("PRAGMA busy_timeout=5000")
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS feedback (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            book_id INTEGER NOT NULL,
-            action TEXT NOT NULL,
-            reason_shown TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    try:
+        cur = conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA synchronous=NORMAL")
+        cur.execute("PRAGMA busy_timeout=5000")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                book_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                reason_shown TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
         )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS seen (
-            book_id INTEGER PRIMARY KEY,
-            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS seen (
+                book_id INTEGER PRIMARY KEY,
+                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
         )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS likes (
-            book_id INTEGER PRIMARY KEY,
-            liked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS likes (
+                book_id INTEGER PRIMARY KEY,
+                liked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
         )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS dislikes (
-            book_id INTEGER PRIMARY KEY,
-            disliked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dislikes (
+                book_id INTEGER PRIMARY KEY,
+                disliked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
         )
-        """
-    )
-    conn.commit()
-    conn.close()
+        conn.commit()
+    finally:
+        conn.close()
 
 
 async def load_state_from_db():
@@ -168,14 +170,16 @@ async def load_state_from_db():
         return STATE_CACHE["likes"], STATE_CACHE["dislikes"], STATE_CACHE["seen"]
     async with DB_LOCK:
         conn = sqlite3.connect(str(DB_PATH))
-        cur = conn.cursor()
-        cur.execute("SELECT book_id FROM likes")
-        likes = {r[0] for r in cur.fetchall()}
-        cur.execute("SELECT book_id FROM dislikes")
-        dislikes = {r[0] for r in cur.fetchall()}
-        cur.execute("SELECT book_id FROM seen")
-        seen = {r[0] for r in cur.fetchall()}
-        conn.close()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT book_id FROM likes")
+            likes = {r[0] for r in cur.fetchall()}
+            cur.execute("SELECT book_id FROM dislikes")
+            dislikes = {r[0] for r in cur.fetchall()}
+            cur.execute("SELECT book_id FROM seen")
+            seen = {r[0] for r in cur.fetchall()}
+        finally:
+            conn.close()
     STATE_CACHE["likes"] = likes
     STATE_CACHE["dislikes"] = dislikes
     STATE_CACHE["seen"] = seen
@@ -186,21 +190,23 @@ async def load_state_from_db():
 async def record_feedback(fb: Feedback):
     async with DB_LOCK:
         conn = sqlite3.connect(str(DB_PATH))
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO feedback (book_id, action, reason_shown) VALUES (?, ?, ?)",
-            (fb.book_id, fb.action, fb.reason_shown),
-        )
-        if fb.action == "like":
-            cur.execute("INSERT OR REPLACE INTO likes (book_id) VALUES (?)", (fb.book_id,))
-            cur.execute("DELETE FROM dislikes WHERE book_id=?", (fb.book_id,))
-        elif fb.action == "dislike":
-            cur.execute("INSERT OR REPLACE INTO dislikes (book_id) VALUES (?)", (fb.book_id,))
-            cur.execute("DELETE FROM likes WHERE book_id=?", (fb.book_id,))
-        # mark seen for any action so a liked/disliked book won't resurface
-        cur.execute("INSERT OR REPLACE INTO seen (book_id) VALUES (?)", (fb.book_id,))
-        conn.commit()
-        conn.close()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO feedback (book_id, action, reason_shown) VALUES (?, ?, ?)",
+                (fb.book_id, fb.action, fb.reason_shown),
+            )
+            if fb.action == "like":
+                cur.execute("INSERT OR REPLACE INTO likes (book_id) VALUES (?)", (fb.book_id,))
+                cur.execute("DELETE FROM dislikes WHERE book_id=?", (fb.book_id,))
+            elif fb.action == "dislike":
+                cur.execute("INSERT OR REPLACE INTO dislikes (book_id) VALUES (?)", (fb.book_id,))
+                cur.execute("DELETE FROM likes WHERE book_id=?", (fb.book_id,))
+            # mark seen for any action so a liked/disliked book won't resurface
+            cur.execute("INSERT OR REPLACE INTO seen (book_id) VALUES (?)", (fb.book_id,))
+            conn.commit()
+        finally:
+            conn.close()
     # in-memory caches: update immediately so the next request sees the new state
     if STATE_CACHE.get("loaded"):
         STATE_CACHE["likes"].discard(fb.book_id)
@@ -236,15 +242,14 @@ def build_index():
     faiss.write_index(index, str(INDEX_PATH))
     (CONFIG_DIR / "books.json").write_text(json.dumps(books, default=str), encoding="utf-8")
 
-    STATE.model = model
-    STATE.index = index
-    STATE.books = books
-    STATE.book_ids = [b["id"] for b in books]
-    STATE.id_to_idx = {bid: i for i, bid in enumerate(STATE.book_ids)}
-    # book list changed: any in-memory state referencing old ids is stale
-    STATE_CACHE.clear()
-    REASON_CACHE.clear()
-    logger.info("Index built: %d books", len(books))
+    # build a fresh state, publish atomically
+    new_state = AppState()
+    new_state.model = model
+    new_state.index = index
+    new_state.books = books
+    new_state.book_ids = [b["id"] for b in books]
+    new_state.id_to_idx = {bid: i for i, bid in enumerate(new_state.book_ids)}
+    return new_state
 
 
 def load_index():
@@ -252,25 +257,46 @@ def load_index():
         return False
     logger.info("Loading existing index...")
     # only instantiate the model once; reuse across reloads
+    new_state = AppState()
     if STATE.model is None:
-        STATE.model = SentenceTransformer(MODEL_NAME)
-    STATE.index = faiss.read_index(str(INDEX_PATH))
-    STATE.books = json.loads((CONFIG_DIR / "books.json").read_text(encoding="utf-8"))
-    STATE.book_ids = [b["id"] for b in STATE.books]
-    STATE.id_to_idx = {bid: i for i, bid in enumerate(STATE.book_ids)}
-    logger.info("Index loaded: %d books", len(STATE.books))
-    return True
+        new_state.model = SentenceTransformer(MODEL_NAME)
+    else:
+        new_state.model = STATE.model  # reuse the loaded model
+    new_state.index = faiss.read_index(str(INDEX_PATH))
+    new_state.books = json.loads((CONFIG_DIR / "books.json").read_text(encoding="utf-8"))
+    new_state.book_ids = [b["id"] for b in new_state.books]
+    new_state.id_to_idx = {bid: i for i, bid in enumerate(new_state.book_ids)}
+    logger.info("Index loaded: %d books", len(new_state.books))
+    return new_state
 
 
-def ensure_index():
+def ensure_index(publish: bool = True):
+    """Build or load the index. Returns the new AppState, or None if no change needed.
+    When publish=False, only loads the model; caller is responsible for the swap.
+    """
     try:
         mtime = CALIBRE_DB.stat().st_mtime
         index_mtime = INDEX_PATH.stat().st_mtime if INDEX_PATH.exists() else 0
-        if not load_index() or mtime > index_mtime:
-            build_index()
+        if not INDEX_PATH.exists() or mtime > index_mtime:
+            new_state = build_index()
+        else:
+            new_state = load_index()
+            if new_state is False:  # no index files at all
+                new_state = build_index()
+        if publish:
+            publish_state(new_state)
     except Exception as e:
         logger.exception("Failed to build/load index: %s", e)
         raise
+
+
+def publish_state(new_state):
+    """Atomically swap STATE for all readers."""
+    global STATE
+    STATE = new_state
+    # book list changed: any in-memory state referencing old ids is stale
+    STATE_CACHE.clear()
+    REASON_CACHE.clear()
 
 
 # ── Recommendation ─────────────────────────────────────────────────────────
@@ -290,7 +316,9 @@ def candidate_pool(likes, dislikes, seen, limit=30):
                 continue
             if "omnibus" in b["title"].lower() or "complete" in b["title"].lower() or "collection" in b["title"].lower():
                 continue
-            pool.append(b)
+            # defensive copy so request handlers can mutate the candidate without
+            # touching the canonical STATE.books entry
+            pool.append(dict(b))
         pool.sort(key=lambda x: len(x.get("description", "")) + len(x.get("tags", [])) * 50, reverse=True)
         pool = pool[:limit * 2]
         np.random.shuffle(pool)
@@ -390,10 +418,12 @@ async def next_recommendation():
     if bid not in seen and bid not in likes and bid not in dislikes:
         async with DB_LOCK:
             conn = sqlite3.connect(str(DB_PATH))
-            cur = conn.cursor()
-            cur.execute("INSERT OR REPLACE INTO seen (book_id) VALUES (?)", (bid,))
-            conn.commit()
-            conn.close()
+            try:
+                cur = conn.cursor()
+                cur.execute("INSERT OR REPLACE INTO seen (book_id) VALUES (?)", (bid,))
+                conn.commit()
+            finally:
+                conn.close()
         seen.add(bid)
         if STATE_CACHE.get("loaded"):
             STATE_CACHE["seen"].add(bid)
@@ -440,19 +470,24 @@ async def recommend():
 
 @app.post("/api/feedback")
 async def feedback(fb: Feedback):
+    # reject feedback for books not in the index (LAN-only deployment, but no reason to write garbage)
+    if fb.book_id not in STATE.id_to_idx:
+        return {"ok": False, "error": "unknown book_id"}
     if fb.action == "more":
         # "more like this" both seeds the recommender (as a like) and records the "more" event
         fb_like = Feedback(book_id=fb.book_id, action="like", reason_shown=fb.reason_shown)
         await record_feedback(fb_like)
         async with DB_LOCK:
             conn = sqlite3.connect(str(DB_PATH))
-            cur = conn.cursor()
-            cur.execute(
-                "INSERT INTO feedback (book_id, action, reason_shown) VALUES (?, ?, ?)",
-                (fb.book_id, "more", fb.reason_shown),
-            )
-            conn.commit()
-            conn.close()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "INSERT INTO feedback (book_id, action, reason_shown) VALUES (?, ?, ?)",
+                    (fb.book_id, "more", fb.reason_shown),
+                )
+                conn.commit()
+            finally:
+                conn.close()
     else:
         await record_feedback(fb)
     return {"ok": True}
@@ -478,22 +513,22 @@ LIBRARY_PATH = Path("/calibre").resolve()
 
 @app.get("/cover/{book_id}/{filename}")
 async def cover(book_id: int, filename: str):
-    # Calibre stores cover.jpg inside the book's path folder.
-    # Reject any book whose resolved path escapes the library root.
-    for b in STATE.books:
-        if b["id"] == book_id:
-            book_dir = (LIBRARY_PATH / b["path"]).resolve()
-            try:
-                book_dir.relative_to(LIBRARY_PATH)
-            except ValueError:
-                return Response(status_code=400)
-            cover_path = book_dir / filename
-            # ensure the final resolved path is still under the book dir
-            try:
-                cover_path.resolve().relative_to(book_dir)
-            except ValueError:
-                return Response(status_code=400)
-            if cover_path.is_file():
-                return FileResponse(str(cover_path))
-            break
+    # O(1) book lookup via id_to_idx
+    idx = STATE.id_to_idx.get(book_id)
+    if idx is None:
+        return Response(status_code=404)
+    b = STATE.books[idx]
+    book_dir = (LIBRARY_PATH / b["path"]).resolve()
+    try:
+        book_dir.relative_to(LIBRARY_PATH)
+    except ValueError:
+        return Response(status_code=400)
+    cover_path = book_dir / filename
+    # ensure the final resolved path is still under the book dir
+    try:
+        cover_path.resolve().relative_to(book_dir)
+    except ValueError:
+        return Response(status_code=400)
+    if cover_path.is_file():
+        return FileResponse(str(cover_path))
     return Response(status_code=404)

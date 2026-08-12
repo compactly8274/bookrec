@@ -38,14 +38,17 @@
   <div class="stats" id="stats">Loading…</div>
   <div id="app"><div class="loading">Loading recommendations…</div></div>
   <script>
+    let currentBook = null;
     async function load() {
       const r = await fetch('/api/recommend');
       const data = await r.json();
       const app = document.getElementById('app');
       if (data.done) {
+        currentBook = null;
         app.innerHTML = '<div class="empty">No more recommendations right now.<br><button onclick="location.reload()">Refresh</button></div>';
         return;
       }
+      currentBook = data.book;
       const b = data.book;
       const cover = b.cover_url ? `<img class="cover" src="${b.cover_url}" alt="cover">` : '<div class="no-cover">📖</div>';
       app.innerHTML = `
@@ -66,11 +69,13 @@
         </div>`;
     }
     async function send(action) {
+      if (!currentBook) return load();
+      const book = currentBook;
+      currentBook = null;
       document.getElementById('app').innerHTML = '<div class="loading">Thinking…</div>';
-      const current = window.currentBook;
-      if (!current) return load();
-      await fetch('/api/feedback', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({book_id: current.id, action, reason_shown: current.reason}) });
-      load();
+      await fetch('/api/feedback', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({book_id: book.id, action, reason_shown: book.reason}) });
+      await load();
+      loadStats();
     }
     async function loadStats() {
       const r = await fetch('/api/stats');
@@ -78,8 +83,8 @@
       document.getElementById('stats').textContent = `${s.total} books · ${s.liked} liked · ${s.disliked} disliked · ${s.seen} seen`;
     }
     function escapeHtml(t) { return (t||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-    window.currentBook = null;
-    fetch('/api/recommend').then(r=>r.json()).then(d=>{ window.currentBook = d.book; load(); loadStats(); });
+    load();
+    loadStats();
   </script>
 </body>
 </html>
