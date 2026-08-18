@@ -19,7 +19,6 @@ import numpy as np
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bookrec")
 
-DATA_DIR = Path("/data")
 CONFIG_DIR = Path("/config")
 DB_PATH = CONFIG_DIR / "bookrec.db"
 CALIBRE_DB = Path("/calibre/metadata.db")
@@ -110,9 +109,7 @@ STATE = AppState()
 # reason cache: (book_id, like_signature) -> reason string.
 # invalidate on every write to likes/dislikes.
 REASON_CACHE: dict = {}
-LIKE_SIG: tuple = ()
 STATE_CACHE: dict = {}  # {"likes":..., "dislikes":..., "seen":..., "loaded":False}
-INDEX_LOCK = asyncio.Lock()
 REBUILD_LOCK = asyncio.Lock()
 DB_LOCK = asyncio.Lock()
 
@@ -196,7 +193,9 @@ async def record_feedback(fb: Feedback):
                 "INSERT INTO feedback (book_id, action, reason_shown) VALUES (?, ?, ?)",
                 (fb.book_id, fb.action, fb.reason_shown),
             )
-            if fb.action == "like":
+            # "more" seeds the recommender exactly like a "like", but is recorded
+            # under its own action so the feedback log stays unambiguous.
+            if fb.action in ("like", "more"):
                 cur.execute("INSERT OR REPLACE INTO likes (book_id) VALUES (?)", (fb.book_id,))
                 cur.execute("DELETE FROM dislikes WHERE book_id=?", (fb.book_id,))
             elif fb.action == "dislike":
@@ -212,7 +211,7 @@ async def record_feedback(fb: Feedback):
         STATE_CACHE["likes"].discard(fb.book_id)
         STATE_CACHE["dislikes"].discard(fb.book_id)
         STATE_CACHE["seen"].add(fb.book_id)
-        if fb.action == "like":
+        if fb.action in ("like", "more"):
             STATE_CACHE["likes"].add(fb.book_id)
         elif fb.action == "dislike":
             STATE_CACHE["dislikes"].add(fb.book_id)
@@ -229,7 +228,7 @@ def build_index():
         raise RuntimeError("No books found in Calibre DB")
 
     logger.info("Loading embedding model %s...", MODEL_NAME)
-    model = SentenceTransformer(MODEL_NAME)
+    model = STATE.model or SentenceTransformer(MODEL_NAME)
 
     texts = [embed_text(b) for b in books]
     logger.info("Embedding %d books...", len(texts))
@@ -270,10 +269,8 @@ def load_index():
     return new_state
 
 
-def ensure_index(publish: bool = True):
-    """Build or load the index. Returns the new AppState, or None if no change needed.
-    When publish=False, only loads the model; caller is responsible for the swap.
-    """
+def ensure_index():
+    """Build or load the index and publish it atomically."""
     try:
         mtime = CALIBRE_DB.stat().st_mtime
         index_mtime = INDEX_PATH.stat().st_mtime if INDEX_PATH.exists() else 0
@@ -281,10 +278,9 @@ def ensure_index(publish: bool = True):
             new_state = build_index()
         else:
             new_state = load_index()
-            if new_state is False:  # no index files at all
+            if new_state is False:  # index exists but books.json missing
                 new_state = build_index()
-        if publish:
-            publish_state(new_state)
+        publish_state(new_state)
     except Exception as e:
         logger.exception("Failed to build/load index: %s", e)
         raise
@@ -307,11 +303,11 @@ def cover_url(book):
     return f"/cover/{book['id']}/cover.jpg"
 
 
-def candidate_pool(likes, dislikes, seen, limit=30):
+def candidate_pool(state, likes, dislikes, seen, limit=30):
     if not likes:
         # cold start: prefer single books with good metadata, not omnibuses
         pool = []
-        for b in STATE.books:
+        for b in state.books:
             if b["id"] in dislikes or b["id"] in seen or not b.get("description"):
                 continue
             if "omnibus" in b["title"].lower() or "complete" in b["title"].lower() or "collection" in b["title"].lower():
@@ -327,29 +323,28 @@ def candidate_pool(likes, dislikes, seen, limit=30):
     # personalised: nearest neighbour over the user's likes
     liked_indices = []
     for bid in likes:
-        idx = STATE.id_to_idx.get(bid)
+        idx = state.id_to_idx.get(bid)
         if idx is not None:
             liked_indices.append(idx)
     if not liked_indices:
-        return candidate_pool(set(), dislikes, seen, limit)
+        return candidate_pool(state, set(), dislikes, seen, limit)
 
-    query = np.zeros((1, STATE.index.d), dtype="float32")
+    query = np.zeros((1, state.index.d), dtype="float32")
     for idx in liked_indices:
-        query += STATE.index.reconstruct(int(idx))
+        query += state.index.reconstruct(int(idx))
     query /= len(liked_indices)
     faiss.normalize_L2(query)
 
-    D, I = STATE.index.search(query, 200)
+    D, I = state.index.search(query, 200)
     pool = []
     found_ids = set()
     for score, idx in zip(D[0], I[0]):
-        book = STATE.books[idx]
+        book = state.books[idx]
         bid = book["id"]
         if bid in likes or bid in dislikes or bid in seen or bid in found_ids:
             continue
         book = dict(book)
         book["score"] = float(score)
-        book["reason"] = "similar to books you liked"
         pool.append(book)
         found_ids.add(bid)
         if len(pool) >= limit:
@@ -366,9 +361,10 @@ async def llm_reason(book, liked_titles, like_sig):
     prompt = f"""The user likes these books: {liked_titles}.
 Recommend the book "{book['title']}" by {', '.join(book.get('authors', [])) or 'unknown'} in one short sentence (under 25 words). Mention a specific theme, style, or mood that connects it to what they like. Keep it casual."""
     try:
+        base = OLLAMA_URL.rstrip("/")
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.post(
-                f"{OLLAMA_URL}/api/generate",
+                f"{base}/api/generate",
                 json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
             )
             r.raise_for_status()
@@ -390,17 +386,17 @@ def deterministic_reason(book, liked_titles):
     return f"{tags} by {authors}" if tags else f"by {authors}"
 
 
-async def next_recommendation():
+async def next_recommendation(state):
     likes, dislikes, seen = await load_state_from_db()
-    pool = candidate_pool(likes, dislikes, seen, limit=30)
+    pool = candidate_pool(state, likes, dislikes, seen, limit=30)
     if not pool:
         return None
     book = pool[0]
     liked_titles = []
     for bid in list(likes)[:3]:
-        idx = STATE.id_to_idx.get(bid)
+        idx = state.id_to_idx.get(bid)
         if idx is not None:
-            liked_titles.append(STATE.books[idx]["title"])
+            liked_titles.append(state.books[idx]["title"])
 
     # signature of current like set, used to memoize LLM reasons
     like_sig = tuple(sorted(likes))
@@ -462,7 +458,8 @@ async def index(request: Request):
 
 @app.get("/api/recommend")
 async def recommend():
-    book = await next_recommendation()
+    state = STATE  # snapshot: keep a consistent view across the whole request
+    book = await next_recommendation(state)
     if not book:
         return {"done": True}
     return {"done": False, "book": book}
@@ -473,30 +470,15 @@ async def feedback(fb: Feedback):
     # reject feedback for books not in the index (LAN-only deployment, but no reason to write garbage)
     if fb.book_id not in STATE.id_to_idx:
         return {"ok": False, "error": "unknown book_id"}
-    if fb.action == "more":
-        # "more like this" both seeds the recommender (as a like) and records the "more" event
-        fb_like = Feedback(book_id=fb.book_id, action="like", reason_shown=fb.reason_shown)
-        await record_feedback(fb_like)
-        async with DB_LOCK:
-            conn = sqlite3.connect(str(DB_PATH))
-            try:
-                cur = conn.cursor()
-                cur.execute(
-                    "INSERT INTO feedback (book_id, action, reason_shown) VALUES (?, ?, ?)",
-                    (fb.book_id, "more", fb.reason_shown),
-                )
-                conn.commit()
-            finally:
-                conn.close()
-    else:
-        await record_feedback(fb)
+    await record_feedback(fb)
     return {"ok": True}
 
 
 @app.get("/api/stats")
 async def stats():
+    state = STATE
     likes, dislikes, seen = await load_state_from_db()
-    return {"total": len(STATE.books), "liked": len(likes), "disliked": len(dislikes), "seen": len(seen)}
+    return {"total": len(state.books), "liked": len(likes), "disliked": len(dislikes), "seen": len(seen)}
 
 
 @app.get("/api/rebuild")
@@ -513,11 +495,12 @@ LIBRARY_PATH = Path("/calibre").resolve()
 
 @app.get("/cover/{book_id}/{filename}")
 async def cover(book_id: int, filename: str):
+    state = STATE  # snapshot: avoid torn reads if a rebuild swaps STATE mid-request
     # O(1) book lookup via id_to_idx
-    idx = STATE.id_to_idx.get(book_id)
+    idx = state.id_to_idx.get(book_id)
     if idx is None:
         return Response(status_code=404)
-    b = STATE.books[idx]
+    b = state.books[idx]
     book_dir = (LIBRARY_PATH / b["path"]).resolve()
     try:
         book_dir.relative_to(LIBRARY_PATH)
