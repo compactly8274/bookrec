@@ -11,6 +11,66 @@ import sys
 from unittest.mock import patch, AsyncMock, MagicMock
 import numpy as np
 
+# ── Mock heavy dependencies before importing main ────────────────────────────
+# The CI environment only has pytest + numpy, not faiss/sentence_transformers/
+# fastapi/httpx. We inject lightweight stubs into sys.modules so that
+# `import main` succeeds without those packages installed.
+
+# faiss stub — provides Kmeans and normalize_L2 (used by _taste_centroids)
+class _FakeKmeans:
+    def __init__(self, d, k, niter=20, verbose=False, seed=42):
+        self.d = d
+        self.k = k
+        self.centroids = np.zeros((k, d), dtype="float32")
+
+    def train(self, vecs):
+        # naive centroids: just pick k evenly spaced rows
+        n = vecs.shape[0]
+        if self.k <= 1:
+            self.centroids = vecs.mean(axis=0, keepdims=True).astype("float32")
+        else:
+            indices = np.linspace(0, n - 1, self.k, dtype=int)
+            self.centroids = vecs[indices].astype("float32")
+
+
+_faiss_stub = MagicMock()
+_faiss_stub.Kmeans = _FakeKmeans
+_faiss_stub.IndexFlatIP = MagicMock
+_faiss_stub.normalize_L2 = lambda x: x  # no-op (vectors are already normalised in tests)
+_faiss_stub.write_index = MagicMock()
+_faiss_stub.read_index = MagicMock()
+sys.modules["faiss"] = _faiss_stub
+
+# sentence_transformers stub
+_st_stub = MagicMock()
+_st_stub.SentenceTransformer = MagicMock()
+sys.modules["sentence_transformers"] = _st_stub
+
+# httpx stub
+sys.modules["httpx"] = MagicMock()
+
+# fastapi + submodules stubs
+sys.modules["fastapi"] = MagicMock()
+sys.modules["fastapi.responses"] = MagicMock()
+sys.modules["fastapi.templating"] = MagicMock()
+
+# pydantic stub — needs BaseModel + Field with pattern validation
+class _StubBaseModel:
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+class _StubField:
+    def __init__(self, *args, **kwargs):
+        self.default = kwargs.get("default", None)
+
+_pydantic_stub = MagicMock()
+_pydantic_stub.BaseModel = _StubBaseModel
+_pydantic_stub.Field = _StubField
+sys.modules["pydantic"] = _pydantic_stub
+
+# ── Now import main ──────────────────────────────────────────────────────────
+
 # Make src/ importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
