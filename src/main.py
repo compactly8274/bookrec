@@ -32,7 +32,7 @@ OLLAMA_MODEL = "gemma3:4b"
 
 class Feedback(BaseModel):
     book_id: int
-    action: str = Field(..., pattern="^(like|dislike|skip|more)$")
+    action: str = Field(..., pattern="^(like|dislike|skip|more|toread)$")
     reason_shown: str = ""
 
 
@@ -110,7 +110,7 @@ STATE = AppState()
 # reason cache: (book_id, like_signature) -> reason string.
 # invalidate on every write to likes/dislikes.
 REASON_CACHE: dict = {}
-STATE_CACHE: dict = {}  # {"likes":..., "dislikes":..., "seen":..., "loaded":False}
+STATE_CACHE: dict = {}  # {"likes":..., "dislikes":..., "seen":..., "toread":..., "loaded":False}
 REBUILD_LOCK = asyncio.Lock()
 DB_LOCK = asyncio.Lock()
 
@@ -158,6 +158,14 @@ def init_db():
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS toread (
+                book_id INTEGER PRIMARY KEY,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
         conn.commit()
     finally:
         conn.close()
@@ -165,7 +173,12 @@ def init_db():
 
 async def load_state_from_db():
     if STATE_CACHE.get("loaded"):
-        return STATE_CACHE["likes"], STATE_CACHE["dislikes"], STATE_CACHE["seen"]
+        return (
+            STATE_CACHE["likes"],
+            STATE_CACHE["dislikes"],
+            STATE_CACHE["seen"],
+            STATE_CACHE["toread"],
+        )
     async with DB_LOCK:
         conn = sqlite3.connect(str(DB_PATH))
         try:
@@ -176,13 +189,16 @@ async def load_state_from_db():
             dislikes = {r[0] for r in cur.fetchall()}
             cur.execute("SELECT book_id FROM seen")
             seen = {r[0] for r in cur.fetchall()}
+            cur.execute("SELECT book_id FROM toread")
+            toread = {r[0] for r in cur.fetchall()}
         finally:
             conn.close()
     STATE_CACHE["likes"] = likes
     STATE_CACHE["dislikes"] = dislikes
     STATE_CACHE["seen"] = seen
+    STATE_CACHE["toread"] = toread
     STATE_CACHE["loaded"] = True
-    return likes, dislikes, seen
+    return likes, dislikes, seen, toread
 
 
 async def record_feedback(fb: Feedback):
@@ -199,10 +215,18 @@ async def record_feedback(fb: Feedback):
             if fb.action in ("like", "more"):
                 cur.execute("INSERT OR REPLACE INTO likes (book_id) VALUES (?)", (fb.book_id,))
                 cur.execute("DELETE FROM dislikes WHERE book_id=?", (fb.book_id,))
+                cur.execute("DELETE FROM toread WHERE book_id=?", (fb.book_id,))
             elif fb.action == "dislike":
                 cur.execute("INSERT OR REPLACE INTO dislikes (book_id) VALUES (?)", (fb.book_id,))
                 cur.execute("DELETE FROM likes WHERE book_id=?", (fb.book_id,))
-            # mark seen for any action so a liked/disliked book won't resurface
+                cur.execute("DELETE FROM toread WHERE book_id=?", (fb.book_id,))
+            elif fb.action == "toread":
+                # "already own it, haven't read it" — record it, but don't treat
+                # it as a taste signal (no like/dislike). Excluded from recs.
+                cur.execute("INSERT OR REPLACE INTO toread (book_id) VALUES (?)", (fb.book_id,))
+                cur.execute("DELETE FROM likes WHERE book_id=?", (fb.book_id,))
+                cur.execute("DELETE FROM dislikes WHERE book_id=?", (fb.book_id,))
+            # mark seen for any action so a liked/disliked/toread book won't resurface
             cur.execute("INSERT OR REPLACE INTO seen (book_id) VALUES (?)", (fb.book_id,))
             conn.commit()
         finally:
@@ -211,11 +235,14 @@ async def record_feedback(fb: Feedback):
     if STATE_CACHE.get("loaded"):
         STATE_CACHE["likes"].discard(fb.book_id)
         STATE_CACHE["dislikes"].discard(fb.book_id)
+        STATE_CACHE["toread"].discard(fb.book_id)
         STATE_CACHE["seen"].add(fb.book_id)
         if fb.action in ("like", "more"):
             STATE_CACHE["likes"].add(fb.book_id)
         elif fb.action == "dislike":
             STATE_CACHE["dislikes"].add(fb.book_id)
+        elif fb.action == "toread":
+            STATE_CACHE["toread"].add(fb.book_id)
     # reasons depend on the user's likes signature — invalidate on any like change
     REASON_CACHE.clear()
 
@@ -342,18 +369,19 @@ def _taste_centroids(state, liked_indices, max_clusters=5):
     return centroids
 
 
-def candidate_pool(state, likes, dislikes, seen, limit=30, shuffle=True):
+def candidate_pool(state, likes, dislikes, seen, toread, limit=30, shuffle=True):
     """Return a candidate pool of up to `limit` books.
 
     When `shuffle` is True the pool is randomized so repeated calls don't walk
     the library in a fixed order. The personalized path otherwise returns
     nearest neighbours in descending similarity, which reads as "in order".
     """
+    excluded = dislikes | seen | toread
     if not likes:
         # cold start: prefer single books with good metadata, not omnibuses
         pool = []
         for b in state.books:
-            if b["id"] in dislikes or b["id"] in seen or not b.get("description"):
+            if b["id"] in excluded or not b.get("description"):
                 continue
             if "omnibus" in b["title"].lower() or "complete" in b["title"].lower() or "collection" in b["title"].lower():
                 continue
@@ -377,7 +405,7 @@ def candidate_pool(state, likes, dislikes, seen, limit=30, shuffle=True):
         if idx is not None:
             liked_indices.append(idx)
     if not liked_indices:
-        return candidate_pool(state, set(), dislikes, seen, limit, shuffle)
+        return candidate_pool(state, set(), dislikes, seen, toread, limit, shuffle)
 
     centroids = _taste_centroids(state, liked_indices)
 
@@ -395,7 +423,7 @@ def candidate_pool(state, likes, dislikes, seen, limit=30, shuffle=True):
             score = float(D[row, col])
             book = state.books[idx]
             bid = book["id"]
-            if bid in likes or bid in dislikes or bid in seen or bid in found_ids:
+            if bid in likes or bid in excluded or bid in found_ids:
                 continue
             book = dict(book)
             book["score"] = score
@@ -496,9 +524,9 @@ async def _decorate_book(state, book, likes, liked_titles, like_sig):
     return book
 
 
-async def _mark_seen(book, likes, dislikes, seen):
+async def _mark_seen(book, likes, dislikes, seen, toread):
     bid = book["id"]
-    if bid in seen or bid in likes or bid in dislikes:
+    if bid in seen or bid in likes or bid in dislikes or bid in toread:
         return
     async with DB_LOCK:
         conn = sqlite3.connect(str(DB_PATH))
@@ -515,15 +543,15 @@ async def _mark_seen(book, likes, dislikes, seen):
 
 async def batch_recommendations(state, count=10):
     """Return up to `count` randomized, diverse recommendations with reasons."""
-    likes, dislikes, seen = await load_state_from_db()
+    likes, dislikes, seen, toread = await load_state_from_db()
     if likes:
         # fetch a larger ranked pool, then select a diverse subset via MMR
-        pool = candidate_pool(state, likes, dislikes, seen, limit=max(count * 5, 50), shuffle=False)
+        pool = candidate_pool(state, likes, dislikes, seen, toread, limit=max(count * 5, 50), shuffle=False)
         pool = diversify(state, pool, count)
         random.shuffle(pool)
     else:
         # cold start: no taste signal, so a random draw is already diverse
-        pool = candidate_pool(state, likes, dislikes, seen, limit=count, shuffle=True)
+        pool = candidate_pool(state, likes, dislikes, seen, toread, limit=count, shuffle=True)
     if not pool:
         return []
     liked_titles = _liked_titles(state, likes)
@@ -536,13 +564,13 @@ async def batch_recommendations(state, count=10):
 
     # mark all shown books as seen so the next batch doesn't repeat them
     for b in books:
-        await _mark_seen(b, likes, dislikes, seen)
+        await _mark_seen(b, likes, dislikes, seen, toread)
     return books
 
 
 async def next_recommendation(state):
-    likes, dislikes, seen = await load_state_from_db()
-    pool = candidate_pool(state, likes, dislikes, seen, limit=30, shuffle=True)
+    likes, dislikes, seen, toread = await load_state_from_db()
+    pool = candidate_pool(state, likes, dislikes, seen, toread, limit=30, shuffle=True)
     if not pool:
         return None
     book = pool[0]
@@ -550,7 +578,7 @@ async def next_recommendation(state):
     like_sig = tuple(sorted(likes))
 
     book = await _decorate_book(state, book, likes, liked_titles, like_sig)
-    await _mark_seen(book, likes, dislikes, seen)
+    await _mark_seen(book, likes, dislikes, seen, toread)
     return book
 
 
@@ -612,8 +640,14 @@ async def feedback(fb: Feedback):
 @app.get("/api/stats")
 async def stats():
     state = STATE
-    likes, dislikes, seen = await load_state_from_db()
-    return {"total": len(state.books), "liked": len(likes), "disliked": len(dislikes), "seen": len(seen)}
+    likes, dislikes, seen, toread = await load_state_from_db()
+    return {
+        "total": len(state.books),
+        "liked": len(likes),
+        "disliked": len(dislikes),
+        "seen": len(seen),
+        "toread": len(toread),
+    }
 
 
 @app.get("/api/rebuild")

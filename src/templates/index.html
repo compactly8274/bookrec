@@ -36,6 +36,8 @@
     .dislike:hover { background:#2a1a1a; }
     .more { background:#1f3a20; color:#90ee90; }
     .more:hover { background:#26482a; }
+    .toread { background:#1f2a3a; color:#8ec5ff; }
+    .toread:hover { background:#26364a; }
     .loading { text-align:center; padding:3rem; color:var(--muted); }
     .empty { text-align:center; padding:3rem; color:var(--muted); }
   </style>
@@ -78,6 +80,7 @@
             <td class="actions">
               <button class="dislike" onclick="send(${b.id},'dislike')">👎</button>
               <button class="skip" onclick="send(${b.id},'skip')">Skip</button>
+              <button class="toread" onclick="send(${b.id},'toread')">📚 To Read</button>
               <button class="more" onclick="send(${b.id},'more')">More</button>
               <button class="like" onclick="send(${b.id},'like')">👍</button>
             </td>
@@ -103,7 +106,7 @@
     async function loadStats() {
       const r = await fetch('/api/stats');
       const s = await r.json();
-      document.getElementById('stats').textContent = `${s.total} books · ${s.liked} liked · ${s.disliked} disliked · ${s.seen} seen`;
+      document.getElementById('stats').textContent = `${s.total} books · ${s.liked} liked · ${s.disliked} disliked · ${s.toread} to read · ${s.seen} seen`;
     }
     function escapeHtml(t) { return (t||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
     load();
