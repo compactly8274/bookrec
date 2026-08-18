@@ -39,6 +39,10 @@ DISLIKE_PENALTY = 0.5
 # Books marked "seen" become eligible again after this many days.
 SEEN_TTL_DAYS = 30
 
+# Fraction of each batch that is random exploration (serendipity) rather than
+# nearest-neighbour exploitation. Set to 0.0 to disable.
+EXPLORATION_RATE = 0.15
+
 
 class Feedback(BaseModel):
     book_id: int
@@ -498,6 +502,33 @@ def candidate_pool(state, likes, dislikes, seen, toread, limit=30, shuffle=True)
     return pool
 
 
+def exploration_pool(state, likes, dislikes, seen, toread, count):
+    """Draw `count` random books from the full library for serendipity.
+
+    Exploration is random but never hostile: it still excludes disliked books
+    (and applies the dislike penalty), seen, to-read, and liked books. It does
+    NOT constrain to the user's taste clusters — that's the whole point.
+    """
+    if count <= 0:
+        return []
+    excluded = likes | dislikes | seen | toread
+    dislike_embs = [
+        state.index.reconstruct(int(state.id_to_idx[bid]))
+        for bid in dislikes
+        if bid in state.id_to_idx
+    ]
+    eligible = []
+    for b in state.books:
+        if b["id"] in excluded:
+            continue
+        d = dict(b)
+        d["score"] = 0.0
+        d["dislike_penalty"] = _dislike_penalty(state, d, dislike_embs)
+        eligible.append(d)
+    random.shuffle(eligible)
+    return eligible[:count]
+
+
 def diversify(state, candidates, count, lambda_=0.7):
     """Select up to `count` diverse candidates via Maximal Marginal Relevance.
 
@@ -600,24 +631,39 @@ async def _mark_seen(book, likes, dislikes, seen, toread):
 
 
 async def batch_recommendations(state, count=10):
-    """Return up to `count` randomized, diverse recommendations with reasons."""
+    """Return up to `count` randomized, diverse recommendations with reasons.
+
+    Mixes exploitation (nearest neighbours of taste) with exploration (random
+    picks from the full library) at EXPLORATION_RATE.
+    """
     likes, dislikes, seen, toread = await load_state_from_db()
+
+    n_explore = int(round(count * EXPLORATION_RATE))
+    n_exploit = count - n_explore
+
     if likes or toread:
-        # fetch a larger ranked pool, then select a diverse subset via MMR
-        pool = candidate_pool(state, likes, dislikes, seen, toread, limit=max(count * 5, 50), shuffle=False)
-        pool = diversify(state, pool, count)
-        random.shuffle(pool)
+        # exploitation: fetch a larger ranked pool, then select a diverse subset
+        pool = candidate_pool(state, likes, dislikes, seen, toread, limit=max(n_exploit * 5, 50), shuffle=False)
+        pool = diversify(state, pool, n_exploit)
     else:
         # cold start: no taste signal, so a random draw is already diverse
-        pool = candidate_pool(state, likes, dislikes, seen, toread, limit=count, shuffle=True)
-    if not pool:
+        pool = candidate_pool(state, likes, dislikes, seen, toread, limit=n_exploit, shuffle=True)
+
+    # exploration: random picks from the full library (respecting dislikes)
+    explore = exploration_pool(state, likes, dislikes, seen, toread, n_explore)
+
+    combined = pool + explore
+    random.shuffle(combined)
+    combined = combined[:count]
+
+    if not combined:
         return []
     liked_titles = _liked_titles(state, likes)
     like_sig = tuple(sorted(likes))
 
     # generate reasons concurrently (LLM calls are the slow part)
     books = await asyncio.gather(
-        *[_decorate_book(state, b, likes, liked_titles, like_sig) for b in pool[:count]]
+        *[_decorate_book(state, b, likes, liked_titles, like_sig) for b in combined]
     )
 
     # mark all shown books as seen so the next batch doesn't repeat them
