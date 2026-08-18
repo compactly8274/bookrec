@@ -19,7 +19,7 @@ Open `http://your-host:8484`.
 
 | Variable | Default | Description |
 |---|---|---|
-| `OLLAMA_URL` | `http://192.168.1.104:11434` | Ollama API base URL. Empty disables LLM reasons. |
+| `OLLAMA_URL` | *(empty)* | Ollama API base URL. Empty disables LLM reasons. |
 | `OLLAMA_MODEL` | `gemma3:4b` | Model name for reason generation. |
 
 ## Volumes
@@ -28,3 +28,22 @@ Open `http://your-host:8484`.
 |---|---|---|
 | `/mnt/user/Books` | `/calibre` | Calibre library (read-only) |
 | `/mnt/user/appdata/bookrec` | `/config` | State, feedback, generated index |
+
+## Permissions
+
+The container runs as an unprivileged user (`UID 99`, `GID 1000`). The `/config`
+volume must be writable by that user, otherwise the app cannot create
+`bookrec.db` and will fail to start. On Unraid this usually works out of the box
+(`nobody:users`), but if you see permission errors, fix the ownership of the
+host directory:
+
+```bash
+chown -R 99:1000 /mnt/user/appdata/bookrec
+```
+
+## First boot
+
+The first start downloads the embedding model (~90 MB) and indexes your entire
+Calibre library, which can take several minutes on a large collection. The
+healthcheck has an extended `start_period` to allow for this; the app is ready
+once `http://your-host:8484/api/stats` returns `200`.
