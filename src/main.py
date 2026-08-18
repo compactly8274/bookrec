@@ -304,6 +304,22 @@ def cover_url(book):
     return f"/cover/{book['id']}/cover.jpg"
 
 
+def _rating_stars(book):
+    """Calibre stores rating as 0 (unrated) or 2..10 (1..5 stars)."""
+    rv = book.get("rating_val")
+    if rv is None:
+        return 0.0
+    try:
+        return float(rv) / 2.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _relevance(book):
+    """Combined relevance: similarity to taste + a mild rating boost."""
+    return book.get("score", 0.0) + _rating_stars(book) * 0.03
+
+
 def _taste_centroids(state, liked_indices, max_clusters=5):
     """Cluster the user's liked books into distinct taste centroids.
 
@@ -344,7 +360,11 @@ def candidate_pool(state, likes, dislikes, seen, limit=30, shuffle=True):
             # defensive copy so request handlers can mutate the candidate without
             # touching the canonical STATE.books entry
             pool.append(dict(b))
-        pool.sort(key=lambda x: len(x.get("description", "")) + len(x.get("tags", [])) * 50, reverse=True)
+        # richness + rating: surface well-described, well-rated books first
+        pool.sort(
+            key=lambda x: len(x.get("description", "")) + len(x.get("tags", [])) * 50 + _rating_stars(x) * 20,
+            reverse=True,
+        )
         pool = pool[:limit * 2]
         if shuffle:
             random.shuffle(pool)
@@ -389,6 +409,38 @@ def candidate_pool(state, likes, dislikes, seen, limit=30, shuffle=True):
     if shuffle:
         random.shuffle(pool)
     return pool
+
+
+def diversify(state, candidates, count, lambda_=0.7):
+    """Select up to `count` diverse candidates via Maximal Marginal Relevance.
+
+    Greedily picks candidates that are both relevant to the user's taste
+    (`_relevance`) and dissimilar to what's already been selected (cosine
+    distance between embeddings). This prevents a batch from being dominated
+    by near-duplicate books (e.g. 8 books by the same author).
+    """
+    if len(candidates) <= count:
+        return candidates
+    embs = {c["id"]: state.index.reconstruct(int(state.id_to_idx[c["id"]])) for c in candidates}
+    selected = []
+    remaining = list(candidates)
+    while remaining and len(selected) < count:
+        best = None
+        best_mmr = -float("inf")
+        for c in remaining:
+            rel = _relevance(c)
+            if selected:
+                ce = embs[c["id"]]
+                max_sim = max(float(np.dot(ce, embs[s["id"]])) for s in selected)
+            else:
+                max_sim = 0.0
+            mmr = lambda_ * rel - (1 - lambda_) * max_sim
+            if mmr > best_mmr:
+                best_mmr = mmr
+                best = c
+        selected.append(best)
+        remaining.remove(best)
+    return selected
 
 
 async def llm_reason(book, liked_titles, like_sig):
@@ -462,9 +514,16 @@ async def _mark_seen(book, likes, dislikes, seen):
 
 
 async def batch_recommendations(state, count=10):
-    """Return up to `count` randomized recommendations with reasons."""
+    """Return up to `count` randomized, diverse recommendations with reasons."""
     likes, dislikes, seen = await load_state_from_db()
-    pool = candidate_pool(state, likes, dislikes, seen, limit=max(count, 30), shuffle=True)
+    if likes:
+        # fetch a larger ranked pool, then select a diverse subset via MMR
+        pool = candidate_pool(state, likes, dislikes, seen, limit=max(count * 5, 50), shuffle=False)
+        pool = diversify(state, pool, count)
+        random.shuffle(pool)
+    else:
+        # cold start: no taste signal, so a random draw is already diverse
+        pool = candidate_pool(state, likes, dislikes, seen, limit=count, shuffle=True)
     if not pool:
         return []
     liked_titles = _liked_titles(state, likes)
