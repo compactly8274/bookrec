@@ -622,13 +622,17 @@ def diversify(state, candidates, count, lambda_=0.7):
     return selected
 
 
-async def llm_reason(book, liked_titles, like_sig):
+async def llm_reason(book, liked_titles, like_sig, similar_to=None):
     if not OLLAMA_URL:
         return ""
     cache_key = (book["id"], like_sig)
     if cache_key in REASON_CACHE:
         return REASON_CACHE[cache_key]
-    prompt = f"""The user likes these books: {liked_titles}.
+    if similar_to:
+        prompt = f"""Recommend a book similar to "{similar_to}".
+Recommend the book "{book['title']}" by {', '.join(book.get('authors', [])) or 'unknown'} in one short sentence (under 25 words). Mention a specific theme, style, or mood that connects it to "{similar_to}". Keep it casual."""
+    else:
+        prompt = f"""The user likes these books: {liked_titles}.
 Recommend the book "{book['title']}" by {', '.join(book.get('authors', [])) or 'unknown'} in one short sentence (under 25 words). Mention a specific theme, style, or mood that connects it to what they like. Keep it casual."""
     try:
         base = OLLAMA_URL.rstrip("/")
@@ -648,9 +652,11 @@ Recommend the book "{book['title']}" by {', '.join(book.get('authors', [])) or '
     return reason
 
 
-def deterministic_reason(book, liked_titles):
+def deterministic_reason(book, liked_titles, similar_to=None):
     tags = ", ".join(book.get("tags", [])[:5])
     authors = ", ".join(book.get("authors", [])[:2])
+    if similar_to:
+        return f"Similar to {similar_to}: {tags} by {authors}." if tags else f"Similar to {similar_to}."
     if liked_titles:
         return f"Because you liked {liked_titles[0]}: {tags} by {authors}." if tags else f"Because you liked {liked_titles[0]}."
     return f"{tags} by {authors}" if tags else f"by {authors}"
@@ -665,11 +671,11 @@ def _liked_titles(state, likes):
     return titles
 
 
-async def _decorate_book(state, book, likes, liked_titles, like_sig):
+async def _decorate_book(state, book, likes, liked_titles, like_sig, similar_to=None):
     """Attach reason + cover_url to a candidate book (mutates the dict copy)."""
-    reason = await llm_reason(book, liked_titles, like_sig)
+    reason = await llm_reason(book, liked_titles, like_sig, similar_to)
     if not reason:
-        reason = deterministic_reason(book, liked_titles)
+        reason = deterministic_reason(book, liked_titles, similar_to)
     book["reason"] = reason
     book["cover_url"] = cover_url(book)
     return book
@@ -687,7 +693,6 @@ async def _mark_seen(book, likes, dislikes, seen, toread):
             conn.commit()
         finally:
             conn.close()
-    seen.add(bid)
 
 
 async def batch_recommendations(state, count=10):
@@ -698,7 +703,9 @@ async def batch_recommendations(state, count=10):
     """
     likes, dislikes, seen, toread = await load_state_from_db()
 
-    n_explore = int(round(count * EXPLORATION_RATE))
+    # floor (not round) so EXPLORATION_RATE is a ceiling, not a banker's-round
+    # surprise: 15% of 10 = 1 exploration pick, not 2.
+    n_explore = int(count * EXPLORATION_RATE)
     n_exploit = count - n_explore
 
     if likes or toread:
@@ -714,7 +721,15 @@ async def batch_recommendations(state, count=10):
 
     combined = pool + explore
     random.shuffle(combined)
-    combined = combined[:count]
+    # dedupe by book id — exploitation and exploration pools can overlap
+    deduped = []
+    seen_ids = set()
+    for b in combined:
+        if b["id"] in seen_ids:
+            continue
+        seen_ids.add(b["id"])
+        deduped.append(b)
+    combined = deduped[:count]
 
     if not combined:
         return []
@@ -778,10 +793,9 @@ async def more_like_books(state, book_id, count=10):
     if not pool:
         return []
 
-    liked_titles = [source["title"]]
     like_sig = ("more", book_id)
     books = await asyncio.gather(
-        *[_decorate_book(state, b, likes, liked_titles, like_sig) for b in pool]
+        *[_decorate_book(state, b, likes, [], like_sig, similar_to=source["title"]) for b in pool]
     )
     return books
 
