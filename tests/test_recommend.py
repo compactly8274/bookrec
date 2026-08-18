@@ -13,7 +13,7 @@ import numpy as np
 
 # ── Mock heavy dependencies before importing main ────────────────────────────
 # The CI environment only has pytest + numpy, not faiss/sentence_transformers/
-# fastapi/httpx. We inject lightweight stubs into sys.modules so that
+# fastapi/httpx/jinja2. We inject lightweight stubs into sys.modules so that
 # `import main` succeeds without those packages installed.
 
 # faiss stub — provides Kmeans and normalize_L2 (used by _taste_centroids)
@@ -49,24 +49,27 @@ sys.modules["sentence_transformers"] = _st_stub
 # httpx stub
 sys.modules["httpx"] = MagicMock()
 
+# jinja2 stub (imported by fastapi.templating, which we mock, but just in case)
+sys.modules["jinja2"] = MagicMock()
+
 # fastapi + submodules stubs
 sys.modules["fastapi"] = MagicMock()
 sys.modules["fastapi.responses"] = MagicMock()
 sys.modules["fastapi.templating"] = MagicMock()
 
-# pydantic stub — needs BaseModel + Field with pattern validation
+# pydantic stub — needs BaseModel + Field that accepts any args
 class _StubBaseModel:
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
             setattr(self, k, v)
 
-class _StubField:
-    def __init__(self, *args, **kwargs):
-        self.default = kwargs.get("default", None)
+def _stub_field(*args, **kwargs):
+    """Accept any arguments (Ellipsis, pattern=, default=, etc.) and return None."""
+    return None
 
 _pydantic_stub = MagicMock()
 _pydantic_stub.BaseModel = _StubBaseModel
-_pydantic_stub.Field = _StubField
+_pydantic_stub.Field = _stub_field
 sys.modules["pydantic"] = _pydantic_stub
 
 # ── Now import main ──────────────────────────────────────────────────────────
