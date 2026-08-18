@@ -28,7 +28,7 @@ INDEX_META_PATH = CONFIG_DIR / "index_meta.json"
 MODEL_NAME = "all-MiniLM-L6-v2"
 
 # Bump whenever embed_text() or MODEL_NAME changes, to force an index rebuild.
-EMBED_VERSION = 2
+EMBED_VERSION = 3
 
 OLLAMA_URL = ""
 OLLAMA_MODEL = "gemma3:4b"
@@ -56,6 +56,10 @@ TITLE_REPEAT = 2
 TAGS_REPEAT = 2
 AUTHOR_REPEAT = 1
 DESCRIPTION_REPEAT = 1
+
+# Relevance boost for a book that is later in a series the user has liked an
+# earlier entry of. Additive to the relevance score (typically 0–1).
+SERIES_BOOST = 0.15
 
 
 class Feedback(BaseModel):
@@ -86,7 +90,7 @@ def get_books():
         books.append(dict(row))
     conn.close()
 
-    # Authors and tags
+    # Authors, tags, and series
     conn = sqlite3.connect(str(CALIBRE_DB))
     cur = conn.cursor()
     cur.execute("SELECT bal.book, a.name FROM books_authors_link bal JOIN authors a ON a.id=bal.author")
@@ -97,11 +101,21 @@ def get_books():
     tags: dict = {}
     for bid, name in cur.fetchall():
         tags.setdefault(bid, []).append(name)
+    cur.execute(
+        "SELECT bsl.book, s.name, bsl.series_index "
+        "FROM books_series_link bsl JOIN series s ON s.id=bsl.series"
+    )
+    series: dict = {}
+    for bid, sname, sidx in cur.fetchall():
+        series[bid] = {"name": sname, "index": sidx}
     conn.close()
 
     for b in books:
         b["authors"] = authors.get(b["id"], [])
         b["tags"] = tags.get(b["id"], [])
+        s = series.get(b["id"])
+        b["series"] = s["name"] if s else None
+        b["series_index"] = s["index"] if s else None
     return books
 
 
@@ -430,12 +444,49 @@ def _dislike_penalty(state, book, dislike_embs):
     return max(float(np.dot(emb, de)) for de in dislike_embs)
 
 
+def _series_progress(state, likes):
+    """Build a {series_name: set(series_index)} map from the user's likes.
+
+    Only likes count as "read" — toread and seen are deliberately excluded
+    because they don't confirm the user has actually finished the book.
+    """
+    progress = {}
+    for bid in likes:
+        idx = state.id_to_idx.get(bid)
+        if idx is None:
+            continue
+        book = state.books[idx]
+        sname = book.get("series")
+        sidx = book.get("series_index")
+        if sname is not None and sidx is not None:
+            progress.setdefault(sname, set()).add(float(sidx))
+    return progress
+
+
+def _series_boost(book, series_progress):
+    """Return SERIES_BOOST if this book is a later entry in a series the user
+    has liked an earlier entry of, else 0.0.
+    """
+    sname = book.get("series")
+    sidx = book.get("series_index")
+    if sname is None or sidx is None:
+        return 0.0
+    liked_indices = series_progress.get(sname)
+    if not liked_indices:
+        return 0.0
+    sidx = float(sidx)
+    if any(liked_idx < sidx for liked_idx in liked_indices):
+        return SERIES_BOOST
+    return 0.0
+
+
 def _relevance(book):
-    """Combined relevance: similarity to taste + rating boost − dislike penalty."""
+    """Combined relevance: similarity + rating boost − dislike penalty + series boost."""
     return (
         book.get("score", 0.0)
         + _rating_stars(book) * 0.03
         - DISLIKE_PENALTY * book.get("dislike_penalty", 0.0)
+        + book.get("series_boost", 0.0)
     )
 
 
@@ -502,6 +553,9 @@ def candidate_pool(state, likes, dislikes, seen, toread, limit=30, shuffle=True)
         if idx is not None:
             signal.append((idx, TOREAD_WEIGHT))
 
+    # Series progress from likes only (not toread/seen).
+    series_prog = _series_progress(state, likes)
+
     if not signal:
         # cold start: no positive signal at all
         pool = []
@@ -550,6 +604,7 @@ def candidate_pool(state, likes, dislikes, seen, toread, limit=30, shuffle=True)
             book = dict(book)
             book["score"] = score
             book["dislike_penalty"] = _dislike_penalty(state, book, dislike_embs)
+            book["series_boost"] = _series_boost(book, series_prog)
             pool.append(book)
             found_ids.add(bid)
             if len(pool) >= limit:
@@ -593,10 +648,10 @@ def diversify(state, candidates, count, lambda_=0.7):
     """Select up to `count` diverse candidates via Maximal Marginal Relevance.
 
     Greedily picks candidates that are both relevant to the user's taste
-    (`_relevance`, which now includes a dislike penalty) and dissimilar to
-    what's already been selected (cosine distance between embeddings). This
-    prevents a batch from being dominated by near-duplicate books (e.g. 8
-    books by the same author).
+    (`_relevance`, which now includes a dislike penalty and series boost) and
+    dissimilar to what's already been selected (cosine distance between
+    embeddings). This prevents a batch from being dominated by near-duplicate
+    books (e.g. 8 books by the same author).
     """
     if len(candidates) <= count:
         return candidates
