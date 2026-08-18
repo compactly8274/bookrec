@@ -33,6 +33,12 @@ OLLAMA_MODEL = "gemma3:4b"
 LIKE_WEIGHT = 1.0
 TOREAD_WEIGHT = 0.5
 
+# Dislikes actively push candidates away (not just exclude them).
+DISLIKE_PENALTY = 0.5
+
+# Books marked "seen" become eligible again after this many days.
+SEEN_TTL_DAYS = 30
+
 
 class Feedback(BaseModel):
     book_id: int
@@ -114,7 +120,9 @@ STATE = AppState()
 # reason cache: (book_id, like_signature) -> reason string.
 # invalidate on every write to likes/dislikes.
 REASON_CACHE: dict = {}
-STATE_CACHE: dict = {}  # {"likes":..., "dislikes":..., "seen":..., "toread":..., "loaded":False}
+# likes/dislikes/toread are cached (no TTL); seen is always queried fresh so
+# the TTL window is respected.
+STATE_CACHE: dict = {}  # {"likes":..., "dislikes":..., "toread":..., "loaded":False}
 REBUILD_LOCK = asyncio.Lock()
 DB_LOCK = asyncio.Lock()
 
@@ -176,33 +184,36 @@ def init_db():
 
 
 async def load_state_from_db():
-    if STATE_CACHE.get("loaded"):
-        return (
-            STATE_CACHE["likes"],
-            STATE_CACHE["dislikes"],
-            STATE_CACHE["seen"],
-            STATE_CACHE["toread"],
-        )
+    if not STATE_CACHE.get("loaded"):
+        async with DB_LOCK:
+            conn = sqlite3.connect(str(DB_PATH))
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT book_id FROM likes")
+                likes = {r[0] for r in cur.fetchall()}
+                cur.execute("SELECT book_id FROM dislikes")
+                dislikes = {r[0] for r in cur.fetchall()}
+                cur.execute("SELECT book_id FROM toread")
+                toread = {r[0] for r in cur.fetchall()}
+            finally:
+                conn.close()
+        STATE_CACHE["likes"] = likes
+        STATE_CACHE["dislikes"] = dislikes
+        STATE_CACHE["toread"] = toread
+        STATE_CACHE["loaded"] = True
+    # seen is always queried fresh so the TTL window is respected
     async with DB_LOCK:
         conn = sqlite3.connect(str(DB_PATH))
         try:
             cur = conn.cursor()
-            cur.execute("SELECT book_id FROM likes")
-            likes = {r[0] for r in cur.fetchall()}
-            cur.execute("SELECT book_id FROM dislikes")
-            dislikes = {r[0] for r in cur.fetchall()}
-            cur.execute("SELECT book_id FROM seen")
+            cur.execute(
+                "SELECT book_id FROM seen WHERE last_seen >= datetime('now', ?)",
+                (f"-{SEEN_TTL_DAYS} days",),
+            )
             seen = {r[0] for r in cur.fetchall()}
-            cur.execute("SELECT book_id FROM toread")
-            toread = {r[0] for r in cur.fetchall()}
         finally:
             conn.close()
-    STATE_CACHE["likes"] = likes
-    STATE_CACHE["dislikes"] = dislikes
-    STATE_CACHE["seen"] = seen
-    STATE_CACHE["toread"] = toread
-    STATE_CACHE["loaded"] = True
-    return likes, dislikes, seen, toread
+    return STATE_CACHE["likes"], STATE_CACHE["dislikes"], seen, STATE_CACHE["toread"]
 
 
 async def record_feedback(fb: Feedback):
@@ -238,7 +249,6 @@ async def record_feedback(fb: Feedback):
         STATE_CACHE["likes"].discard(fb.book_id)
         STATE_CACHE["dislikes"].discard(fb.book_id)
         STATE_CACHE["toread"].discard(fb.book_id)
-        STATE_CACHE["seen"].add(fb.book_id)
         if fb.action == "like":
             STATE_CACHE["likes"].add(fb.book_id)
         elif fb.action == "dislike":
@@ -344,9 +354,25 @@ def _rating_stars(book):
         return 0.0
 
 
+def _dislike_penalty(state, book, dislike_embs):
+    """Max cosine similarity between a book and the user's disliked books.
+
+    Used to actively push candidates away from disliked content (not just
+    exclude the disliked books themselves).
+    """
+    if not dislike_embs:
+        return 0.0
+    emb = state.index.reconstruct(int(state.id_to_idx[book["id"]]))
+    return max(float(np.dot(emb, de)) for de in dislike_embs)
+
+
 def _relevance(book):
-    """Combined relevance: similarity to taste + a mild rating boost."""
-    return book.get("score", 0.0) + _rating_stars(book) * 0.03
+    """Combined relevance: similarity to taste + rating boost − dislike penalty."""
+    return (
+        book.get("score", 0.0)
+        + _rating_stars(book) * 0.03
+        - DISLIKE_PENALTY * book.get("dislike_penalty", 0.0)
+    )
 
 
 def _taste_centroids(state, signal, max_clusters=5):
@@ -394,6 +420,13 @@ def candidate_pool(state, likes, dislikes, seen, toread, limit=30, shuffle=True)
     """
     excluded = dislikes | seen | toread
 
+    # Precompute disliked embeddings once for the negative-signal penalty.
+    dislike_embs = [
+        state.index.reconstruct(int(state.id_to_idx[bid]))
+        for bid in dislikes
+        if bid in state.id_to_idx
+    ]
+
     # Build the positive signal: likes (full weight) + to-read (soft weight).
     signal = []
     for bid in likes:
@@ -415,10 +448,16 @@ def candidate_pool(state, likes, dislikes, seen, toread, limit=30, shuffle=True)
                 continue
             # defensive copy so request handlers can mutate the candidate without
             # touching the canonical STATE.books entry
-            pool.append(dict(b))
-        # richness + rating: surface well-described, well-rated books first
+            d = dict(b)
+            d["dislike_penalty"] = _dislike_penalty(state, d, dislike_embs)
+            pool.append(d)
+        # richness + rating − dislike penalty: surface well-described, well-rated,
+        # not-disliked-similar books first
         pool.sort(
-            key=lambda x: len(x.get("description", "")) + len(x.get("tags", [])) * 50 + _rating_stars(x) * 20,
+            key=lambda x: len(x.get("description", ""))
+            + len(x.get("tags", [])) * 50
+            + _rating_stars(x) * 20
+            - DISLIKE_PENALTY * x.get("dislike_penalty", 0.0) * 20,
             reverse=True,
         )
         pool = pool[:limit * 2]
@@ -446,6 +485,7 @@ def candidate_pool(state, likes, dislikes, seen, toread, limit=30, shuffle=True)
                 continue
             book = dict(book)
             book["score"] = score
+            book["dislike_penalty"] = _dislike_penalty(state, book, dislike_embs)
             pool.append(book)
             found_ids.add(bid)
             if len(pool) >= limit:
@@ -462,9 +502,10 @@ def diversify(state, candidates, count, lambda_=0.7):
     """Select up to `count` diverse candidates via Maximal Marginal Relevance.
 
     Greedily picks candidates that are both relevant to the user's taste
-    (`_relevance`) and dissimilar to what's already been selected (cosine
-    distance between embeddings). This prevents a batch from being dominated
-    by near-duplicate books (e.g. 8 books by the same author).
+    (`_relevance`, which now includes a dislike penalty) and dissimilar to
+    what's already been selected (cosine distance between embeddings). This
+    prevents a batch from being dominated by near-duplicate books (e.g. 8
+    books by the same author).
     """
     if len(candidates) <= count:
         return candidates
@@ -556,8 +597,6 @@ async def _mark_seen(book, likes, dislikes, seen, toread):
         finally:
             conn.close()
     seen.add(bid)
-    if STATE_CACHE.get("loaded"):
-        STATE_CACHE["seen"].add(bid)
 
 
 async def batch_recommendations(state, count=10):
@@ -703,6 +742,20 @@ async def feedback(fb: Feedback):
     if fb.book_id not in STATE.id_to_idx:
         return {"ok": False, "error": "unknown book_id"}
     await record_feedback(fb)
+    return {"ok": True}
+
+
+@app.post("/api/reset-seen")
+async def reset_seen():
+    """Clear the seen history so all books become eligible again."""
+    async with DB_LOCK:
+        conn = sqlite3.connect(str(DB_PATH))
+        try:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM seen")
+            conn.commit()
+        finally:
+            conn.close()
     return {"ok": True}
 
 
