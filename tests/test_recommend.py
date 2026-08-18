@@ -26,8 +26,11 @@ from main import (
     exploration_pool,
     diversify,
     _taste_centroids,
+    _series_progress,
+    _series_boost,
     batch_recommendations,
     more_like_books,
+    SERIES_BOOST,
 )
 
 
@@ -75,7 +78,7 @@ class FakeState:
 
 
 def make_book(bid, title="Book", authors=None, tags=None, description="A book.",
-              has_cover=True, rating_val=None):
+              has_cover=True, rating_val=None, series=None, series_index=None):
     return {
         "id": bid,
         "title": title,
@@ -86,6 +89,8 @@ def make_book(bid, title="Book", authors=None, tags=None, description="A book.",
         "rating_val": rating_val,
         "authors": authors or ["Author"],
         "tags": tags or [],
+        "series": series,
+        "series_index": series_index,
     }
 
 
@@ -193,9 +198,14 @@ class TestRelevance:
         expected = 0.8 - 0.5 * 0.9
         assert abs(_relevance(book) - expected) < 1e-6
 
+    def test_with_series_boost(self):
+        book = {"score": 0.5, "rating_val": None, "series_boost": SERIES_BOOST}
+        expected = 0.5 + SERIES_BOOST
+        assert abs(_relevance(book) - expected) < 1e-6
+
     def test_combined(self):
-        book = {"score": 0.5, "rating_val": 8, "dislike_penalty": 0.6}
-        expected = 0.5 + 4.0 * 0.03 - 0.5 * 0.6
+        book = {"score": 0.5, "rating_val": 8, "dislike_penalty": 0.6, "series_boost": SERIES_BOOST}
+        expected = 0.5 + 4.0 * 0.03 - 0.5 * 0.6 + SERIES_BOOST
         assert abs(_relevance(book) - expected) < 1e-6
 
 
@@ -238,6 +248,88 @@ class TestDeterministicReason:
         book = make_book(1, title="Dune", tags=[], authors=["Herbert"])
         reason = deterministic_reason(book, ["Foundation"])
         assert "Foundation" in reason
+
+
+# ── _series_progress / _series_boost ─────────────────────────────────────────
+
+class TestSeriesProgress:
+
+    def test_no_series_in_likes(self):
+        books = [make_book(1, description="Book 1")]
+        state = FakeState(books)
+        progress = _series_progress(state, {1})
+        assert progress == {}
+
+    def test_series_detected(self):
+        books = [
+            make_book(1, series="Dune Series", series_index=1.0),
+            make_book(2, series="Dune Series", series_index=2.0),
+        ]
+        state = FakeState(books)
+        progress = _series_progress(state, {1})
+        assert "Dune Series" in progress
+        assert 1.0 in progress["Dune Series"]
+
+    def test_multiple_series(self):
+        books = [
+            make_book(1, series="Series A", series_index=1.0),
+            make_book(2, series="Series B", series_index=3.0),
+        ]
+        state = FakeState(books)
+        progress = _series_progress(state, {1, 2})
+        assert "Series A" in progress
+        assert "Series B" in progress
+
+    def test_ignores_toread_and_seen(self):
+        """Only likes should contribute to series progress, not toread/seen."""
+        books = [
+            make_book(1, series="S", series_index=1.0),
+            make_book(2, series="S", series_index=2.0),
+        ]
+        state = FakeState(books)
+        # Only book 1 is liked — book 2 is toread but not liked
+        progress = _series_progress(state, {1})
+        assert "S" in progress
+        assert 2.0 not in progress["S"]
+
+
+class TestSeriesBoost:
+
+    def test_no_series(self):
+        book = make_book(1, series=None, series_index=None)
+        assert _series_boost(book, {}) == 0.0
+
+    def test_no_progress(self):
+        book = make_book(1, series="Dune", series_index=2.0)
+        assert _series_boost(book, {}) == 0.0
+
+    def test_earlier_liked(self):
+        book = make_book(2, series="Dune", series_index=2.0)
+        progress = {"Dune": {1.0}}
+        assert _series_boost(book, progress) == SERIES_BOOST
+
+    def test_later_liked_not_boosted(self):
+        """If user liked book 3, book 1 should NOT be boosted (only forward)."""
+        book = make_book(1, series="Dune", series_index=1.0)
+        progress = {"Dune": {3.0}}
+        assert _series_boost(book, progress) == 0.0
+
+    def test_same_index_not_boosted(self):
+        """Same index (same book) should not boost itself."""
+        book = make_book(1, series="Dune", series_index=2.0)
+        progress = {"Dune": {2.0}}
+        assert _series_boost(book, progress) == 0.0
+
+    def test_fractional_index(self):
+        """Fractional indices (novellas between books) should work."""
+        book = make_book(1, series="S", series_index=2.5)
+        progress = {"S": {2.0}}
+        assert _series_boost(book, progress) == SERIES_BOOST
+
+    def test_multiple_liked_earlier(self):
+        book = make_book(3, series="S", series_index=3.0)
+        progress = {"S": {1.0, 2.0}}
+        assert _series_boost(book, progress) == SERIES_BOOST
 
 
 # ── candidate_pool ───────────────────────────────────────────────────────────
@@ -304,6 +396,25 @@ class TestCandidatePool:
         pool = candidate_pool(state, set(), set(), set(), set(), limit=1, shuffle=False)
         if pool:
             assert pool[0] is not state.books[0]
+
+    def test_series_boost_applied(self):
+        """A sequel in a series the user has liked an earlier entry of gets a boost."""
+        books = [
+            make_book(1, series="Dune", series_index=1.0, description="Book 1"),
+            make_book(2, series="Dune", series_index=2.0, description="Book 2"),
+            make_book(3, series="Dune", series_index=3.0, description="Book 3"),
+            make_book(4, description="Unrelated book"),
+            make_book(5, description="Unrelated book 2"),
+        ]
+        state = FakeState(books)
+        pool = candidate_pool(state, likes={1}, dislikes=set(), seen=set(), toread=set(), limit=10, shuffle=False)
+        by_id = {b["id"]: b for b in pool}
+        if 2 in by_id:
+            assert by_id[2]["series_boost"] == SERIES_BOOST
+        if 3 in by_id:
+            assert by_id[3]["series_boost"] == SERIES_BOOST
+        if 4 in by_id:
+            assert by_id[4].get("series_boost", 0.0) == 0.0
 
 
 # ── exploration_pool ─────────────────────────────────────────────────────────
