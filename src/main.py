@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import asyncio
+import random
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -303,7 +304,13 @@ def cover_url(book):
     return f"/cover/{book['id']}/cover.jpg"
 
 
-def candidate_pool(state, likes, dislikes, seen, limit=30):
+def candidate_pool(state, likes, dislikes, seen, limit=30, shuffle=True):
+    """Return a candidate pool of up to `limit` books.
+
+    When `shuffle` is True the pool is randomized so repeated calls don't walk
+    the library in a fixed order. The personalized path otherwise returns
+    nearest neighbours in descending similarity, which reads as "in order".
+    """
     if not likes:
         # cold start: prefer single books with good metadata, not omnibuses
         pool = []
@@ -317,7 +324,8 @@ def candidate_pool(state, likes, dislikes, seen, limit=30):
             pool.append(dict(b))
         pool.sort(key=lambda x: len(x.get("description", "")) + len(x.get("tags", [])) * 50, reverse=True)
         pool = pool[:limit * 2]
-        np.random.shuffle(pool)
+        if shuffle:
+            random.shuffle(pool)
         return pool[:limit]
 
     # personalised: nearest neighbour over the user's likes
@@ -327,7 +335,7 @@ def candidate_pool(state, likes, dislikes, seen, limit=30):
         if idx is not None:
             liked_indices.append(idx)
     if not liked_indices:
-        return candidate_pool(state, set(), dislikes, seen, limit)
+        return candidate_pool(state, set(), dislikes, seen, limit, shuffle)
 
     query = np.zeros((1, state.index.d), dtype="float32")
     for idx in liked_indices:
@@ -349,6 +357,8 @@ def candidate_pool(state, likes, dislikes, seen, limit=30):
         found_ids.add(bid)
         if len(pool) >= limit:
             break
+    if shuffle:
+        random.shuffle(pool)
     return pool
 
 
@@ -386,44 +396,73 @@ def deterministic_reason(book, liked_titles):
     return f"{tags} by {authors}" if tags else f"by {authors}"
 
 
-async def next_recommendation(state):
-    likes, dislikes, seen = await load_state_from_db()
-    pool = candidate_pool(state, likes, dislikes, seen, limit=30)
-    if not pool:
-        return None
-    book = pool[0]
-    liked_titles = []
+def _liked_titles(state, likes):
+    titles = []
     for bid in list(likes)[:3]:
         idx = state.id_to_idx.get(bid)
         if idx is not None:
-            liked_titles.append(state.books[idx]["title"])
+            titles.append(state.books[idx]["title"])
+    return titles
 
-    # signature of current like set, used to memoize LLM reasons
-    like_sig = tuple(sorted(likes))
 
+async def _decorate_book(state, book, likes, liked_titles, like_sig):
+    """Attach reason + cover_url to a candidate book (mutates the dict copy)."""
     reason = await llm_reason(book, liked_titles, like_sig)
     if not reason:
         reason = deterministic_reason(book, liked_titles)
-
     book["reason"] = reason
     book["cover_url"] = cover_url(book)
+    return book
 
-    # mark as seen so a card that the user just looks at but doesn't click
-    # won't resurface on the next /api/recommend
+
+async def _mark_seen(book, likes, dislikes, seen):
     bid = book["id"]
-    if bid not in seen and bid not in likes and bid not in dislikes:
-        async with DB_LOCK:
-            conn = sqlite3.connect(str(DB_PATH))
-            try:
-                cur = conn.cursor()
-                cur.execute("INSERT OR REPLACE INTO seen (book_id) VALUES (?)", (bid,))
-                conn.commit()
-            finally:
-                conn.close()
-        seen.add(bid)
-        if STATE_CACHE.get("loaded"):
-            STATE_CACHE["seen"].add(bid)
+    if bid in seen or bid in likes or bid in dislikes:
+        return
+    async with DB_LOCK:
+        conn = sqlite3.connect(str(DB_PATH))
+        try:
+            cur = conn.cursor()
+            cur.execute("INSERT OR REPLACE INTO seen (book_id) VALUES (?)", (bid,))
+            conn.commit()
+        finally:
+            conn.close()
+    seen.add(bid)
+    if STATE_CACHE.get("loaded"):
+        STATE_CACHE["seen"].add(bid)
 
+
+async def batch_recommendations(state, count=10):
+    """Return up to `count` randomized recommendations with reasons."""
+    likes, dislikes, seen = await load_state_from_db()
+    pool = candidate_pool(state, likes, dislikes, seen, limit=max(count, 30), shuffle=True)
+    if not pool:
+        return []
+    liked_titles = _liked_titles(state, likes)
+    like_sig = tuple(sorted(likes))
+
+    # generate reasons concurrently (LLM calls are the slow part)
+    books = await asyncio.gather(
+        *[_decorate_book(state, b, likes, liked_titles, like_sig) for b in pool[:count]]
+    )
+
+    # mark all shown books as seen so the next batch doesn't repeat them
+    for b in books:
+        await _mark_seen(b, likes, dislikes, seen)
+    return books
+
+
+async def next_recommendation(state):
+    likes, dislikes, seen = await load_state_from_db()
+    pool = candidate_pool(state, likes, dislikes, seen, limit=30, shuffle=True)
+    if not pool:
+        return None
+    book = pool[0]
+    liked_titles = _liked_titles(state, likes)
+    like_sig = tuple(sorted(likes))
+
+    book = await _decorate_book(state, book, likes, liked_titles, like_sig)
+    await _mark_seen(book, likes, dislikes, seen)
     return book
 
 
@@ -463,6 +502,14 @@ async def recommend():
     if not book:
         return {"done": True}
     return {"done": False, "book": book}
+
+
+@app.get("/api/recommendations")
+async def recommendations(count: int = 10):
+    state = STATE
+    count = max(1, min(count, 50))
+    books = await batch_recommendations(state, count=count)
+    return {"done": len(books) == 0, "books": books}
 
 
 @app.post("/api/feedback")
