@@ -304,6 +304,28 @@ def cover_url(book):
     return f"/cover/{book['id']}/cover.jpg"
 
 
+def _taste_centroids(state, liked_indices, max_clusters=5):
+    """Cluster the user's liked books into distinct taste centroids.
+
+    Averaging all liked embeddings into a single vector collapses distinct
+    tastes (e.g. sci-fi + history) into a meaningless midpoint. Instead we
+    cluster the liked embeddings and return one centroid per taste, so each
+    taste gets its own nearest-neighbour query.
+    """
+    vecs = np.vstack([state.index.reconstruct(int(i)) for i in liked_indices]).astype("float32")
+    n = vecs.shape[0]
+    k = min(n, max_clusters)
+    if k <= 1:
+        centroid = vecs.mean(axis=0, keepdims=True)
+        faiss.normalize_L2(centroid)
+        return centroid
+    kmeans = faiss.Kmeans(state.index.d, k, niter=20, verbose=False, seed=42)
+    kmeans.train(vecs)
+    centroids = kmeans.centroids
+    faiss.normalize_L2(centroids)
+    return centroids
+
+
 def candidate_pool(state, likes, dislikes, seen, limit=30, shuffle=True):
     """Return a candidate pool of up to `limit` books.
 
@@ -328,7 +350,7 @@ def candidate_pool(state, likes, dislikes, seen, limit=30, shuffle=True):
             random.shuffle(pool)
         return pool[:limit]
 
-    # personalised: nearest neighbour over the user's likes
+    # personalised: nearest neighbour over the user's likes, one query per taste
     liked_indices = []
     for bid in likes:
         idx = state.id_to_idx.get(bid)
@@ -337,26 +359,33 @@ def candidate_pool(state, likes, dislikes, seen, limit=30, shuffle=True):
     if not liked_indices:
         return candidate_pool(state, set(), dislikes, seen, limit, shuffle)
 
-    query = np.zeros((1, state.index.d), dtype="float32")
-    for idx in liked_indices:
-        query += state.index.reconstruct(int(idx))
-    query /= len(liked_indices)
-    faiss.normalize_L2(query)
+    centroids = _taste_centroids(state, liked_indices)
 
-    D, I = state.index.search(query, 200)
+    # search all taste centroids in one batched call: D/I are (k, n)
+    D, I = state.index.search(centroids, 200)
+
+    # interleave results across clusters so a single dominant taste can't
+    # crowd out the others, then dedupe by book id
     pool = []
     found_ids = set()
-    for score, idx in zip(D[0], I[0]):
-        book = state.books[idx]
-        bid = book["id"]
-        if bid in likes or bid in dislikes or bid in seen or bid in found_ids:
-            continue
-        book = dict(book)
-        book["score"] = float(score)
-        pool.append(book)
-        found_ids.add(bid)
+    n_clusters = I.shape[0]
+    for col in range(I.shape[1]):
+        for row in range(n_clusters):
+            idx = int(I[row, col])
+            score = float(D[row, col])
+            book = state.books[idx]
+            bid = book["id"]
+            if bid in likes or bid in dislikes or bid in seen or bid in found_ids:
+                continue
+            book = dict(book)
+            book["score"] = score
+            pool.append(book)
+            found_ids.add(bid)
+            if len(pool) >= limit:
+                break
         if len(pool) >= limit:
             break
+
     if shuffle:
         random.shuffle(pool)
     return pool
