@@ -14,6 +14,8 @@
     .toolbar { display:flex; gap:.5rem; align-items:center; margin-bottom:1rem; }
     .toolbar button { background:#333; color:var(--fg); border:none; border-radius:8px; padding:.5rem 1rem; cursor:pointer; }
     .toolbar button:hover { background:#444; }
+    .toolbar .danger { background:#3a1f1f; color:#ff9b9b; }
+    .toolbar .danger:hover { background:#4a2626; }
     table { width:100%; border-collapse:collapse; background:var(--card); border-radius:12px; overflow:hidden; box-shadow:0 10px 30px rgba(0,0,0,.5); }
     th, td { padding:.8rem 1rem; text-align:left; vertical-align:top; border-bottom:1px solid #2a2a2a; }
     th { color:var(--muted); font-weight:600; font-size:.85rem; text-transform:uppercase; letter-spacing:.03em; background:#161616; }
@@ -48,6 +50,7 @@
     <div class="stats" id="stats">Loading…</div>
     <div class="toolbar">
       <button onclick="load()">🔄 New batch</button>
+      <button class="danger" onclick="resetSeen()">↺ Reset seen</button>
     </div>
     <div id="app"><div class="loading">Loading recommendations…</div></div>
   </div>
@@ -122,6 +125,12 @@
       if (row) row.remove();
       await fetch('/api/feedback', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({book_id: bookId, action, reason_shown: book.reason}) });
       loadStats();
+    }
+    async function resetSeen() {
+      if (!confirm('Clear your seen history? All books will become eligible for recommendations again.')) return;
+      await fetch('/api/reset-seen', { method:'POST' });
+      loadStats();
+      load();
     }
     async function loadStats() {
       const r = await fetch('/api/stats');
