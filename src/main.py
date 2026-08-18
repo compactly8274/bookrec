@@ -29,6 +29,10 @@ MODEL_NAME = "all-MiniLM-L6-v2"
 OLLAMA_URL = ""
 OLLAMA_MODEL = "gemma3:4b"
 
+# Positive-signal weights: a "like" is a strong signal, "to read" is a soft one.
+LIKE_WEIGHT = 1.0
+TOREAD_WEIGHT = 0.5
+
 
 class Feedback(BaseModel):
     book_id: int
@@ -221,8 +225,8 @@ async def record_feedback(fb: Feedback):
                 cur.execute("DELETE FROM likes WHERE book_id=?", (fb.book_id,))
                 cur.execute("DELETE FROM toread WHERE book_id=?", (fb.book_id,))
             elif fb.action == "toread":
-                # "already own it, haven't read it" — record it, but don't treat
-                # it as a taste signal (no like/dislike). Excluded from recs.
+                # "already own it, haven't read it" — a soft positive signal.
+                # Record it, but don't treat it as a full like/dislike.
                 cur.execute("INSERT OR REPLACE INTO toread (book_id) VALUES (?)", (fb.book_id,))
                 cur.execute("DELETE FROM likes WHERE book_id=?", (fb.book_id,))
                 cur.execute("DELETE FROM dislikes WHERE book_id=?", (fb.book_id,))
@@ -347,15 +351,29 @@ def _relevance(book):
     return book.get("score", 0.0) + _rating_stars(book) * 0.03
 
 
-def _taste_centroids(state, liked_indices, max_clusters=5):
-    """Cluster the user's liked books into distinct taste centroids.
+def _taste_centroids(state, signal, max_clusters=5):
+    """Cluster the user's positive signals into distinct taste centroids.
 
-    Averaging all liked embeddings into a single vector collapses distinct
-    tastes (e.g. sci-fi + history) into a meaningless midpoint. Instead we
-    cluster the liked embeddings and return one centroid per taste, so each
-    taste gets its own nearest-neighbour query.
+    `signal` is a list of (index, weight) pairs. Likes carry full weight
+    (LIKE_WEIGHT); "to read" books carry half weight (TOREAD_WEIGHT) as a soft
+    positive signal.
+
+    Averaging all signals into a single vector collapses distinct tastes
+    (e.g. sci-fi + history) into a meaningless midpoint. Instead we cluster
+    the signals and return one centroid per taste, so each taste gets its own
+    nearest-neighbour query.
+
+    faiss.Kmeans has no native per-point weights, so we approximate them by
+    duplicating vectors: weight 1.0 -> 2 copies, weight 0.5 -> 1 copy. This
+    gives to-read books half the influence of a like in the clustering.
     """
-    vecs = np.vstack([state.index.reconstruct(int(i)) for i in liked_indices]).astype("float32")
+    vecs = []
+    for idx, w in signal:
+        copies = max(1, int(round(w * 2)))
+        v = state.index.reconstruct(int(idx))
+        for _ in range(copies):
+            vecs.append(v)
+    vecs = np.vstack(vecs).astype("float32")
     n = vecs.shape[0]
     k = min(n, max_clusters)
     if k <= 1:
@@ -377,8 +395,20 @@ def candidate_pool(state, likes, dislikes, seen, toread, limit=30, shuffle=True)
     nearest neighbours in descending similarity, which reads as "in order".
     """
     excluded = dislikes | seen | toread
-    if not likes:
-        # cold start: prefer single books with good metadata, not omnibuses
+
+    # Build the positive signal: likes (full weight) + to-read (soft weight).
+    signal = []
+    for bid in likes:
+        idx = state.id_to_idx.get(bid)
+        if idx is not None:
+            signal.append((idx, LIKE_WEIGHT))
+    for bid in toread:
+        idx = state.id_to_idx.get(bid)
+        if idx is not None:
+            signal.append((idx, TOREAD_WEIGHT))
+
+    if not signal:
+        # cold start: no positive signal at all
         pool = []
         for b in state.books:
             if b["id"] in excluded or not b.get("description"):
@@ -398,16 +428,7 @@ def candidate_pool(state, likes, dislikes, seen, toread, limit=30, shuffle=True)
             random.shuffle(pool)
         return pool[:limit]
 
-    # personalised: nearest neighbour over the user's likes, one query per taste
-    liked_indices = []
-    for bid in likes:
-        idx = state.id_to_idx.get(bid)
-        if idx is not None:
-            liked_indices.append(idx)
-    if not liked_indices:
-        return candidate_pool(state, set(), dislikes, seen, toread, limit, shuffle)
-
-    centroids = _taste_centroids(state, liked_indices)
+    centroids = _taste_centroids(state, signal)
 
     # search all taste centroids in one batched call: D/I are (k, n)
     D, I = state.index.search(centroids, 200)
@@ -544,7 +565,7 @@ async def _mark_seen(book, likes, dislikes, seen, toread):
 async def batch_recommendations(state, count=10):
     """Return up to `count` randomized, diverse recommendations with reasons."""
     likes, dislikes, seen, toread = await load_state_from_db()
-    if likes:
+    if likes or toread:
         # fetch a larger ranked pool, then select a diverse subset via MMR
         pool = candidate_pool(state, likes, dislikes, seen, toread, limit=max(count * 5, 50), shuffle=False)
         pool = diversify(state, pool, count)
