@@ -36,7 +36,7 @@ TOREAD_WEIGHT = 0.5
 
 class Feedback(BaseModel):
     book_id: int
-    action: str = Field(..., pattern="^(like|dislike|skip|more|toread)$")
+    action: str = Field(..., pattern="^(like|dislike|skip|toread)$")
     reason_shown: str = ""
 
 
@@ -214,9 +214,7 @@ async def record_feedback(fb: Feedback):
                 "INSERT INTO feedback (book_id, action, reason_shown) VALUES (?, ?, ?)",
                 (fb.book_id, fb.action, fb.reason_shown),
             )
-            # "more" seeds the recommender exactly like a "like", but is recorded
-            # under its own action so the feedback log stays unambiguous.
-            if fb.action in ("like", "more"):
+            if fb.action == "like":
                 cur.execute("INSERT OR REPLACE INTO likes (book_id) VALUES (?)", (fb.book_id,))
                 cur.execute("DELETE FROM dislikes WHERE book_id=?", (fb.book_id,))
                 cur.execute("DELETE FROM toread WHERE book_id=?", (fb.book_id,))
@@ -241,7 +239,7 @@ async def record_feedback(fb: Feedback):
         STATE_CACHE["dislikes"].discard(fb.book_id)
         STATE_CACHE["toread"].discard(fb.book_id)
         STATE_CACHE["seen"].add(fb.book_id)
-        if fb.action in ("like", "more"):
+        if fb.action == "like":
             STATE_CACHE["likes"].add(fb.book_id)
         elif fb.action == "dislike":
             STATE_CACHE["dislikes"].add(fb.book_id)
@@ -603,6 +601,46 @@ async def next_recommendation(state):
     return book
 
 
+async def more_like_books(state, book_id, count=10):
+    """One-shot "more like this": nearest neighbours of a single book.
+
+    This is a pure query — it does NOT persist anything and does NOT seed the
+    recommender. The source book's embedding is used directly as the query.
+    """
+    idx = state.id_to_idx.get(book_id)
+    if idx is None:
+        return None
+    likes, dislikes, seen, toread = await load_state_from_db()
+    source = state.books[idx]
+
+    query = state.index.reconstruct(int(idx)).reshape(1, -1).astype("float32")
+    faiss.normalize_L2(query)
+    D, I = state.index.search(query, 200)
+
+    excluded = likes | dislikes | seen | toread | {book_id}
+    pool = []
+    for score, nidx in zip(D[0], I[0]):
+        nidx = int(nidx)
+        book = state.books[nidx]
+        bid = book["id"]
+        if bid in excluded:
+            continue
+        b = dict(book)
+        b["score"] = float(score)
+        pool.append(b)
+        if len(pool) >= count:
+            break
+    if not pool:
+        return []
+
+    liked_titles = [source["title"]]
+    like_sig = ("more", book_id)
+    books = await asyncio.gather(
+        *[_decorate_book(state, b, likes, liked_titles, like_sig) for b in pool]
+    )
+    return books
+
+
 # ── FastAPI app ──────────────────────────────────────────────────────────────
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -646,6 +684,16 @@ async def recommendations(count: int = 10):
     state = STATE
     count = max(1, min(count, 50))
     books = await batch_recommendations(state, count=count)
+    return {"done": len(books) == 0, "books": books}
+
+
+@app.get("/api/more-like/{book_id}")
+async def more_like(book_id: int, count: int = 10):
+    state = STATE
+    count = max(1, min(count, 50))
+    books = await more_like_books(state, book_id, count=count)
+    if books is None:
+        return Response(status_code=404)
     return {"done": len(books) == 0, "books": books}
 
 
