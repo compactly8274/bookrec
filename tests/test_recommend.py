@@ -104,6 +104,7 @@ class FakeIndex:
 
     Stores unit-normalised vectors and supports reconstruct() + search().
     search() returns brute-force cosine similarities (dot products on L2-normalised vectors).
+    Pads results with -1 indices when k > number of vectors (like real FAISS).
     """
 
     def __init__(self, vectors):
@@ -115,14 +116,16 @@ class FakeIndex:
 
     def search(self, query, k):
         # query: (nq, d) → returns (D, I) with shape (nq, k)
+        n = self._vectors.shape[0]
         sims = self._vectors @ query.T  # (n, nq)
-        D = np.empty((query.shape[0], k), dtype="float32")
-        I = np.empty((query.shape[0], k), dtype="int64")
+        D = np.full((query.shape[0], k), -1.0, dtype="float32")
+        I = np.full((query.shape[0], k), -1, dtype="int64")
         for i in range(query.shape[0]):
             col = sims[:, i]
-            order = np.argsort(-col)[:k]
-            D[i] = col[order]
-            I[i] = order
+            actual_k = min(k, n)
+            order = np.argsort(-col)[:actual_k]
+            D[i, :actual_k] = col[order]
+            I[i, :actual_k] = order
         return D, I
 
 
@@ -136,7 +139,8 @@ class FakeState:
         # deterministic unit vectors from book id
         rng = np.random.RandomState(42)
         vecs = rng.randn(len(books), dim).astype("float32")
-        vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
+        if len(books) > 0:
+            vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
         self.index = FakeIndex(vecs)
 
 
@@ -556,9 +560,10 @@ class TestDiversify:
 class TestTasteCentroids:
 
     def test_single_signal_returns_one_centroid(self):
+        """With weight 0.5, duplication produces 1 copy → k=1 → single centroid."""
         books = [make_book(i) for i in range(1, 6)]
         state = FakeState(books)
-        centroids = _taste_centroids(state, [(0, 1.0)])
+        centroids = _taste_centroids(state, [(0, 0.5)])
         assert centroids.shape == (1, state.index.d)
 
     def test_multiple_signals_can_produce_multiple_centroids(self):
