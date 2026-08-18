@@ -24,7 +24,11 @@ CONFIG_DIR = Path("/config")
 DB_PATH = CONFIG_DIR / "bookrec.db"
 CALIBRE_DB = Path("/calibre/metadata.db")
 INDEX_PATH = CONFIG_DIR / "index.faiss"
+INDEX_META_PATH = CONFIG_DIR / "index_meta.json"
 MODEL_NAME = "all-MiniLM-L6-v2"
+
+# Bump whenever embed_text() or MODEL_NAME changes, to force an index rebuild.
+EMBED_VERSION = 2
 
 OLLAMA_URL = ""
 OLLAMA_MODEL = "gemma3:4b"
@@ -42,6 +46,16 @@ SEEN_TTL_DAYS = 30
 # Fraction of each batch that is random exploration (serendipity) rather than
 # nearest-neighbour exploitation. Set to 0.0 to disable.
 EXPLORATION_RATE = 0.15
+
+# Embedding field weighting. all-MiniLM-L6-v2 has a ~256-token input limit, so
+# the description must be truncated to leave room for the more discriminative
+# title/tags. Repetition approximates per-field weighting (the model has no
+# native weighting); title/tags are repeated, description is not.
+DESCRIPTION_MAX_WORDS = 120
+TITLE_REPEAT = 2
+TAGS_REPEAT = 2
+AUTHOR_REPEAT = 1
+DESCRIPTION_REPEAT = 1
 
 
 class Feedback(BaseModel):
@@ -91,16 +105,41 @@ def get_books():
     return books
 
 
+def _truncate_words(text, max_words):
+    if not text:
+        return ""
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    return " ".join(words[:max_words])
+
+
 def embed_text(book):
+    """Build the embedding input with field weighting.
+
+    Title and tags are the most discriminative fields for "is this book like
+    that book", so they're repeated (weighted up) and placed first. The
+    description is truncated and placed last, so if the model's token window
+    overflows, it eats the description — never the title/tags.
+    """
     parts = []
-    if book["title"]:
-        parts.append(book["title"])
-    if book["authors"]:
-        parts.append(", ".join(book["authors"]))
-    if book["tags"]:
-        parts.append(", ".join(book["tags"]))
-    if book["description"]:
-        parts.append(book["description"])
+
+    title = book.get("title") or ""
+    if title:
+        parts.extend([title] * TITLE_REPEAT)
+
+    tags = ", ".join(book.get("tags", []))
+    if tags:
+        parts.extend([tags] * TAGS_REPEAT)
+
+    authors = ", ".join(book.get("authors", []))
+    if authors:
+        parts.extend([authors] * AUTHOR_REPEAT)
+
+    description = _truncate_words(book.get("description") or "", DESCRIPTION_MAX_WORDS)
+    if description:
+        parts.extend([description] * DESCRIPTION_REPEAT)
+
     return " | ".join(parts)
 
 
@@ -265,6 +304,16 @@ async def record_feedback(fb: Feedback):
 
 # ── Indexing ─────────────────────────────────────────────────────────────────
 
+def _read_index_meta():
+    """Read the index metadata sidecar, or {} if missing/corrupt."""
+    try:
+        if INDEX_META_PATH.exists():
+            return json.loads(INDEX_META_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
 def build_index():
     logger.info("Loading Calibre library...")
     books = get_books()
@@ -284,6 +333,10 @@ def build_index():
 
     faiss.write_index(index, str(INDEX_PATH))
     (CONFIG_DIR / "books.json").write_text(json.dumps(books, default=str), encoding="utf-8")
+    INDEX_META_PATH.write_text(
+        json.dumps({"embed_version": EMBED_VERSION, "model_name": MODEL_NAME}),
+        encoding="utf-8",
+    )
 
     # build a fresh state, publish atomically
     new_state = AppState()
@@ -318,7 +371,14 @@ def ensure_index():
     try:
         mtime = CALIBRE_DB.stat().st_mtime
         index_mtime = INDEX_PATH.stat().st_mtime if INDEX_PATH.exists() else 0
-        if not INDEX_PATH.exists() or mtime > index_mtime:
+        meta = _read_index_meta()
+        stale = (
+            not INDEX_PATH.exists()
+            or mtime > index_mtime
+            or meta.get("embed_version") != EMBED_VERSION
+            or meta.get("model_name") != MODEL_NAME
+        )
+        if stale:
             new_state = build_index()
         else:
             new_state = load_index()
