@@ -7,7 +7,7 @@ services:
       - "8484:8000"
     environment:
       # Ollama endpoint for LLM-generated reasons. Leave empty to disable LLM.
-      OLLAMA_URL: "http://192.168.1.104:11434"
+      OLLAMA_URL: ""
       OLLAMA_MODEL: "gemma3:4b"
     volumes:
       - /mnt/user/Books:/calibre:ro
@@ -21,4 +21,6 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 60s
+      # First boot downloads the embedding model (~90 MB) and indexes the whole
+      # library, which can take several minutes on a large collection.
+      start_period: 10m
