@@ -64,7 +64,11 @@
         return;
       }
       currentBooks = data.books;
-      const rows = data.books.map(b => {
+      renderTable(data.books);
+    }
+    function renderTable(books) {
+      const app = document.getElementById('app');
+      const rows = books.map(b => {
         const cover = b.cover_url
           ? `<img class="cover" src="${b.cover_url}" alt="cover">`
           : '<div class="no-cover">📖</div>';
@@ -81,7 +85,7 @@
               <button class="dislike" onclick="send(${b.id},'dislike')">👎</button>
               <button class="skip" onclick="send(${b.id},'skip')">Skip</button>
               <button class="toread" onclick="send(${b.id},'toread')">📚 To Read</button>
-              <button class="more" onclick="send(${b.id},'more')">More</button>
+              <button class="more" onclick="moreLike(${b.id})">More</button>
               <button class="like" onclick="send(${b.id},'like')">👍</button>
             </td>
           </tr>`;
@@ -93,6 +97,22 @@
           </thead>
           <tbody>${rows}</tbody>
         </table>`;
+    }
+    async function moreLike(bookId) {
+      const app = document.getElementById('app');
+      app.innerHTML = '<div class="loading">Finding similar books…</div>';
+      const r = await fetch(`/api/more-like/${bookId}?count=10`);
+      if (r.status === 404) {
+        app.innerHTML = '<div class="empty">Book not found.</div>';
+        return;
+      }
+      const data = await r.json();
+      if (data.done || !data.books || data.books.length === 0) {
+        app.innerHTML = '<div class="empty">No similar books found.<br><button onclick="load()">Back to recommendations</button></div>';
+        return;
+      }
+      currentBooks = data.books;
+      renderTable(data.books);
     }
     async function send(bookId, action) {
       const book = currentBooks.find(b => b.id === bookId);
