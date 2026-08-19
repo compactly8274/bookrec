@@ -47,6 +47,8 @@
     .more:hover { background:#26482a; }
     .toread { background:#1f2a3a; color:#8ec5ff; }
     .toread:hover { background:#26364a; }
+    .have-read { background:#1a3a1a; color:#7fd47f; font-weight:600; }
+    .have-read:hover { background:#244a24; }
   </style>
 </head>
 <body>
@@ -60,10 +62,11 @@
   <script>
     let currentBooks = [];
     let currentTab = 'recommend';
-    let statsData = { total:0, liked:0, disliked:0, seen:0, toread:0 };
+    let statsData = { total:0, liked:0, disliked:0, seen:0, toread:0, read:0 };
 
     const TAB_DEFS = [
       { id:'recommend', label:'Recommendations', icon:'📚' },
+      { id:'have-read', label:'Have Read', icon:'📖 ✅', action:'read' },
       { id:'liked', label:'Liked', icon:'👍', action:'like' },
       { id:'more', label:'More Like This', icon:'🔍' },
       { id:'toread', label:'To Read', icon:'📖', action:'toread' },
@@ -76,6 +79,7 @@
       if (action === 'dislike') return statsData.disliked;
       if (action === 'toread') return statsData.toread;
       if (action === 'skip') return statsData.seen;
+      if (action === 'read') return statsData.read;
       return '';
     }
 
@@ -159,6 +163,7 @@
             <button class="dislike" onclick="send(${b.id},'dislike')">👎</button>
             <button class="skip" onclick="send(${b.id},'skip')">Skip</button>
             <button class="toread" onclick="send(${b.id},'toread')">📚 To Read</button>
+            <button class="have-read" onclick="send(${b.id},'read')">📖 ✅ Have Read</button>
             <button class="more" onclick="moreLike(${b.id})">More</button>
             <button class="like" onclick="send(${b.id},'like')">👍</button>
           </td>` : '<td class="actions"></td>';
@@ -213,11 +218,11 @@
     async function loadStats() {
       const r = await fetch('/api/stats');
       statsData = await r.json();
-      document.getElementById('stats').textContent = `${statsData.total} books · ${statsData.liked} liked · ${statsData.disliked} disliked · ${statsData.toread} to read · ${statsData.seen} seen`;
+      document.getElementById('stats').textContent = `${statsData.total} books · ${statsData.liked} liked · ${statsData.disliked} disliked · ${statsData.toread} to read · ${statsData.read || 0} read · ${statsData.seen} seen`;
       renderTabs();
     }
 
-    function escapeHtml(t) { return (t||'').replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c])); }
+    function escapeHtml(t) { return (t||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
     loadStats();
     loadRecommendations();
