@@ -85,14 +85,9 @@ def get_books():
         LEFT JOIN ratings r ON r.id = brl.rating
         """
     )
-    books = []
-    for row in cur.fetchall():
-        books.append(dict(row))
-    conn.close()
+    books = [dict(row) for row in cur.fetchall()]
 
     # Authors, tags, and series
-    conn = sqlite3.connect(str(CALIBRE_DB))
-    cur = conn.cursor()
     cur.execute("SELECT bal.book, a.name FROM books_authors_link bal JOIN authors a ON a.id=bal.author")
     authors: dict = {}
     for bid, name in cur.fetchall():
@@ -513,8 +508,10 @@ def _taste_centroids(state, signal, max_clusters=5):
         for _ in range(copies):
             vecs.append(v)
     vecs = np.vstack(vecs).astype("float32")
-    n = vecs.shape[0]
-    k = min(n, max_clusters)
+    # k is capped by the number of distinct signal points, not the duplicated
+    # vector count above — otherwise a single like (2 copies) would ask
+    # k-means for 2 clusters from 2 identical points.
+    k = min(len(signal), max_clusters)
     if k <= 1:
         centroid = vecs.mean(axis=0, keepdims=True)
         faiss.normalize_L2(centroid)
@@ -750,14 +747,28 @@ async def _mark_seen(book, likes, dislikes, seen, toread):
             conn.close()
 
 
-async def batch_recommendations(state, count=10):
-    """Return up to `count` randomized, diverse recommendations with reasons.
+async def _mark_seen_batch(books, likes, dislikes, seen, toread):
+    """Mark multiple books as seen in a single connection/transaction."""
+    excluded = likes | dislikes | seen | toread
+    ids = [b["id"] for b in books if b["id"] not in excluded]
+    if not ids:
+        return
+    async with DB_LOCK:
+        conn = sqlite3.connect(str(DB_PATH))
+        try:
+            cur = conn.cursor()
+            cur.executemany("INSERT OR REPLACE INTO seen (book_id) VALUES (?)", [(bid,) for bid in ids])
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _build_recommendation_pool(state, likes, dislikes, seen, toread, count):
+    """CPU-bound: FAISS search/k-means/MMR. Run off the event loop via to_thread.
 
     Mixes exploitation (nearest neighbours of taste) with exploration (random
     picks from the full library) at EXPLORATION_RATE.
     """
-    likes, dislikes, seen, toread = await load_state_from_db()
-
     # floor (not round) so EXPLORATION_RATE is a ceiling, not a banker's-round
     # surprise: 15% of 10 = 1 exploration pick, not 2.
     n_explore = int(count * EXPLORATION_RATE)
@@ -784,8 +795,16 @@ async def batch_recommendations(state, count=10):
             continue
         seen_ids.add(b["id"])
         deduped.append(b)
-    combined = deduped[:count]
+    return deduped[:count]
 
+
+async def batch_recommendations(state, count=10):
+    """Return up to `count` randomized, diverse recommendations with reasons."""
+    likes, dislikes, seen, toread = await load_state_from_db()
+
+    combined = await asyncio.to_thread(
+        _build_recommendation_pool, state, likes, dislikes, seen, toread, count
+    )
     if not combined:
         return []
     liked_titles = _liked_titles(state, likes)
@@ -797,14 +816,13 @@ async def batch_recommendations(state, count=10):
     )
 
     # mark all shown books as seen so the next batch doesn't repeat them
-    for b in books:
-        await _mark_seen(b, likes, dislikes, seen, toread)
+    await _mark_seen_batch(books, likes, dislikes, seen, toread)
     return books
 
 
 async def next_recommendation(state):
     likes, dislikes, seen, toread = await load_state_from_db()
-    pool = candidate_pool(state, likes, dislikes, seen, toread, limit=30, shuffle=True)
+    pool = await asyncio.to_thread(candidate_pool, state, likes, dislikes, seen, toread, limit=30, shuffle=True)
     if not pool:
         return None
     book = pool[0]
@@ -816,18 +834,8 @@ async def next_recommendation(state):
     return book
 
 
-async def more_like_books(state, book_id, count=10):
-    """One-shot "more like this": nearest neighbours of a single book.
-
-    This is a pure query — it does NOT persist anything and does NOT seed the
-    recommender. The source book's embedding is used directly as the query.
-    """
-    idx = state.id_to_idx.get(book_id)
-    if idx is None:
-        return None
-    likes, dislikes, seen, toread = await load_state_from_db()
-    source = state.books[idx]
-
+def _more_like_pool(state, idx, likes, dislikes, seen, toread, book_id, count):
+    """CPU-bound: FAISS search. Run off the event loop via to_thread."""
     query = state.index.reconstruct(int(idx)).reshape(1, -1).astype("float32")
     faiss.normalize_L2(query)
     D, I = state.index.search(query, 200)
@@ -845,6 +853,22 @@ async def more_like_books(state, book_id, count=10):
         pool.append(b)
         if len(pool) >= count:
             break
+    return pool
+
+
+async def more_like_books(state, book_id, count=10):
+    """One-shot "more like this": nearest neighbours of a single book.
+
+    This is a pure query — it does NOT persist anything and does NOT seed the
+    recommender. The source book's embedding is used directly as the query.
+    """
+    idx = state.id_to_idx.get(book_id)
+    if idx is None:
+        return None
+    likes, dislikes, seen, toread = await load_state_from_db()
+    source = state.books[idx]
+
+    pool = await asyncio.to_thread(_more_like_pool, state, idx, likes, dislikes, seen, toread, book_id, count)
     if not pool:
         return []
 
@@ -866,7 +890,7 @@ async def lifespan(app: FastAPI):
     global OLLAMA_URL, OLLAMA_MODEL
     init_db()
     try:
-        env = json.loads((CONFIG_DIR / "env.json").read_text()) if (CONFIG_DIR / "env.json").exists() else {}
+        env = json.loads((CONFIG_DIR / "env.json").read_text(encoding="utf-8")) if (CONFIG_DIR / "env.json").exists() else {}
     except Exception:
         env = {}
     OLLAMA_URL = env.get("OLLAMA_URL", "") or os.environ.get("OLLAMA_URL", "")
