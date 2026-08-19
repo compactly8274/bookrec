@@ -36,6 +36,7 @@ OLLAMA_MODEL = "gemma3:4b"
 # Positive-signal weights: a "like" is a strong signal, "to read" is a soft one.
 LIKE_WEIGHT = 1.0
 TOREAD_WEIGHT = 0.5
+READ_WEIGHT = 1.0
 
 # Dislikes actively push candidates away (not just exclude them).
 DISLIKE_PENALTY = 0.5
@@ -64,7 +65,7 @@ SERIES_BOOST = 0.15
 
 class Feedback(BaseModel):
     book_id: int
-    action: str = Field(..., pattern="^(like|dislike|skip|toread)$")
+    action: str = Field(..., pattern="^(like|dislike|skip|toread|read)$")
     reason_shown: str = ""
 
 
@@ -177,9 +178,9 @@ STATE = AppState()
 # reason cache: (book_id, like_signature) -> reason string.
 # invalidate on every write to likes/dislikes.
 REASON_CACHE: dict = {}
-# likes/dislikes/toread are cached (no TTL); seen is always queried fresh so
+# likes/dislikes/toread/read are cached (no TTL); seen is always queried fresh so
 # the TTL window is respected.
-STATE_CACHE: dict = {}  # {"likes":..., "dislikes":..., "toread":..., "loaded":False}
+STATE_CACHE: dict = {}  # {"likes":..., "dislikes":..., "toread":..., "read":..., "loaded":False}
 REBUILD_LOCK = asyncio.Lock()
 DB_LOCK = asyncio.Lock()
 
@@ -235,6 +236,14 @@ def init_db():
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS read (
+                book_id INTEGER PRIMARY KEY,
+                read_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
         conn.commit()
     finally:
         conn.close()
@@ -252,11 +261,14 @@ async def load_state_from_db():
                 dislikes = {r[0] for r in cur.fetchall()}
                 cur.execute("SELECT book_id FROM toread")
                 toread = {r[0] for r in cur.fetchall()}
+                cur.execute("SELECT book_id FROM read")
+                read_books = {r[0] for r in cur.fetchall()}
             finally:
                 conn.close()
         STATE_CACHE["likes"] = likes
         STATE_CACHE["dislikes"] = dislikes
         STATE_CACHE["toread"] = toread
+        STATE_CACHE["read"] = read_books
         STATE_CACHE["loaded"] = True
     # seen is always queried fresh so the TTL window is respected
     async with DB_LOCK:
@@ -270,7 +282,7 @@ async def load_state_from_db():
             seen = {r[0] for r in cur.fetchall()}
         finally:
             conn.close()
-    return STATE_CACHE["likes"], STATE_CACHE["dislikes"], seen, STATE_CACHE["toread"]
+    return STATE_CACHE["likes"], STATE_CACHE["dislikes"], seen, STATE_CACHE["toread"], STATE_CACHE["read"]
 
 
 async def record_feedback(fb: Feedback):
@@ -286,17 +298,23 @@ async def record_feedback(fb: Feedback):
                 cur.execute("INSERT OR REPLACE INTO likes (book_id) VALUES (?)", (fb.book_id,))
                 cur.execute("DELETE FROM dislikes WHERE book_id=?", (fb.book_id,))
                 cur.execute("DELETE FROM toread WHERE book_id=?", (fb.book_id,))
+                cur.execute("DELETE FROM read WHERE book_id=?", (fb.book_id,))
             elif fb.action == "dislike":
                 cur.execute("INSERT OR REPLACE INTO dislikes (book_id) VALUES (?)", (fb.book_id,))
                 cur.execute("DELETE FROM likes WHERE book_id=?", (fb.book_id,))
                 cur.execute("DELETE FROM toread WHERE book_id=?", (fb.book_id,))
+                cur.execute("DELETE FROM read WHERE book_id=?", (fb.book_id,))
             elif fb.action == "toread":
-                # "already own it, haven't read it" — a soft positive signal.
-                # Record it, but don't treat it as a full like/dislike.
                 cur.execute("INSERT OR REPLACE INTO toread (book_id) VALUES (?)", (fb.book_id,))
                 cur.execute("DELETE FROM likes WHERE book_id=?", (fb.book_id,))
                 cur.execute("DELETE FROM dislikes WHERE book_id=?", (fb.book_id,))
-            # mark seen for any action so a liked/disliked/toread book won't resurface
+                cur.execute("DELETE FROM read WHERE book_id=?", (fb.book_id,))
+            elif fb.action == "read":
+                cur.execute("INSERT OR REPLACE INTO read (book_id) VALUES (?)", (fb.book_id,))
+                cur.execute("DELETE FROM likes WHERE book_id=?", (fb.book_id,))
+                cur.execute("DELETE FROM dislikes WHERE book_id=?", (fb.book_id,))
+                cur.execute("DELETE FROM toread WHERE book_id=?", (fb.book_id,))
+            # mark seen for any action so a liked/disliked/toread/read book won't resurface
             cur.execute("INSERT OR REPLACE INTO seen (book_id) VALUES (?)", (fb.book_id,))
             conn.commit()
         finally:
@@ -306,12 +324,15 @@ async def record_feedback(fb: Feedback):
         STATE_CACHE["likes"].discard(fb.book_id)
         STATE_CACHE["dislikes"].discard(fb.book_id)
         STATE_CACHE["toread"].discard(fb.book_id)
+        STATE_CACHE["read"].discard(fb.book_id)
         if fb.action == "like":
             STATE_CACHE["likes"].add(fb.book_id)
         elif fb.action == "dislike":
             STATE_CACHE["dislikes"].add(fb.book_id)
         elif fb.action == "toread":
             STATE_CACHE["toread"].add(fb.book_id)
+        elif fb.action == "read":
+            STATE_CACHE["read"].add(fb.book_id)
     # reasons depend on the user's likes signature — invalidate on any like change
     REASON_CACHE.clear()
 
@@ -526,14 +547,14 @@ def _taste_centroids(state, signal, max_clusters=5):
     return centroids
 
 
-def candidate_pool(state, likes, dislikes, seen, toread, limit=30, shuffle=True):
+def candidate_pool(state, likes, dislikes, seen, toread, read_books, limit=30, shuffle=True):
     """Return a candidate pool of up to `limit` books.
 
     When `shuffle` is True the pool is randomized so repeated calls don't walk
     the library in a fixed order. The personalized path otherwise returns
     nearest neighbours in descending similarity, which reads as "in order".
     """
-    excluded = dislikes | seen | toread
+    excluded = dislikes | seen | toread | read_books
 
     # Precompute disliked embeddings once for the negative-signal penalty.
     dislike_embs = [
@@ -542,7 +563,8 @@ def candidate_pool(state, likes, dislikes, seen, toread, limit=30, shuffle=True)
         if bid in state.id_to_idx
     ]
 
-    # Build the positive signal: likes (full weight) + to-read (soft weight).
+    # Build the positive signal: likes (full weight) + to-read (soft weight) +
+    # read (full weight — you actually read it, so it's a strong signal).
     signal = []
     for bid in likes:
         idx = state.id_to_idx.get(bid)
@@ -552,6 +574,10 @@ def candidate_pool(state, likes, dislikes, seen, toread, limit=30, shuffle=True)
         idx = state.id_to_idx.get(bid)
         if idx is not None:
             signal.append((idx, TOREAD_WEIGHT))
+    for bid in read_books:
+        idx = state.id_to_idx.get(bid)
+        if idx is not None:
+            signal.append((idx, READ_WEIGHT))
 
     # Series progress from likes only (not toread/seen).
     series_prog = _series_progress(state, likes)
@@ -617,16 +643,16 @@ def candidate_pool(state, likes, dislikes, seen, toread, limit=30, shuffle=True)
     return pool
 
 
-def exploration_pool(state, likes, dislikes, seen, toread, count):
+def exploration_pool(state, likes, dislikes, seen, toread, read_books, count):
     """Draw `count` random books from the full library for serendipity.
 
     Exploration is random but never hostile: it still excludes disliked books
-    (and applies the dislike penalty), seen, to-read, and liked books. It does
+    (and applies the dislike penalty), seen, to-read, read, and liked books. It does
     NOT constrain to the user's taste clusters — that's the whole point.
     """
     if count <= 0:
         return []
-    excluded = likes | dislikes | seen | toread
+    excluded = likes | dislikes | seen | toread | read_books
     dislike_embs = [
         state.index.reconstruct(int(state.id_to_idx[bid]))
         for bid in dislikes
@@ -736,9 +762,9 @@ async def _decorate_book(state, book, likes, liked_titles, like_sig, similar_to=
     return book
 
 
-async def _mark_seen(book, likes, dislikes, seen, toread):
+async def _mark_seen(book, likes, dislikes, seen, toread, read_books):
     bid = book["id"]
-    if bid in seen or bid in likes or bid in dislikes or bid in toread:
+    if bid in seen or bid in likes or bid in dislikes or bid in toread or bid in read_books:
         return
     async with DB_LOCK:
         conn = sqlite3.connect(str(DB_PATH))
@@ -756,23 +782,23 @@ async def batch_recommendations(state, count=10):
     Mixes exploitation (nearest neighbours of taste) with exploration (random
     picks from the full library) at EXPLORATION_RATE.
     """
-    likes, dislikes, seen, toread = await load_state_from_db()
+    likes, dislikes, seen, toread, read_books = await load_state_from_db()
 
     # floor (not round) so EXPLORATION_RATE is a ceiling, not a banker's-round
     # surprise: 15% of 10 = 1 exploration pick, not 2.
     n_explore = int(count * EXPLORATION_RATE)
     n_exploit = count - n_explore
 
-    if likes or toread:
+    if likes or toread or read_books:
         # exploitation: fetch a larger ranked pool, then select a diverse subset
-        pool = candidate_pool(state, likes, dislikes, seen, toread, limit=max(n_exploit * 5, 50), shuffle=False)
+        pool = candidate_pool(state, likes, dislikes, seen, toread, read_books, limit=max(n_exploit * 5, 50), shuffle=False)
         pool = diversify(state, pool, n_exploit)
     else:
         # cold start: no taste signal, so a random draw is already diverse
-        pool = candidate_pool(state, likes, dislikes, seen, toread, limit=n_exploit, shuffle=True)
+        pool = candidate_pool(state, likes, dislikes, seen, toread, read_books, limit=n_exploit, shuffle=True)
 
     # exploration: random picks from the full library (respecting dislikes)
-    explore = exploration_pool(state, likes, dislikes, seen, toread, n_explore)
+    explore = exploration_pool(state, likes, dislikes, seen, toread, read_books, n_explore)
 
     combined = pool + explore
     random.shuffle(combined)
@@ -798,13 +824,13 @@ async def batch_recommendations(state, count=10):
 
     # mark all shown books as seen so the next batch doesn't repeat them
     for b in books:
-        await _mark_seen(b, likes, dislikes, seen, toread)
+        await _mark_seen(b, likes, dislikes, seen, toread, read_books)
     return books
 
 
 async def next_recommendation(state):
-    likes, dislikes, seen, toread = await load_state_from_db()
-    pool = candidate_pool(state, likes, dislikes, seen, toread, limit=30, shuffle=True)
+    likes, dislikes, seen, toread, read_books = await load_state_from_db()
+    pool = candidate_pool(state, likes, dislikes, seen, toread, read_books, limit=30, shuffle=True)
     if not pool:
         return None
     book = pool[0]
@@ -812,7 +838,7 @@ async def next_recommendation(state):
     like_sig = tuple(sorted(likes))
 
     book = await _decorate_book(state, book, likes, liked_titles, like_sig)
-    await _mark_seen(book, likes, dislikes, seen, toread)
+    await _mark_seen(book, likes, dislikes, seen, toread, read_books)
     return book
 
 
@@ -825,14 +851,14 @@ async def more_like_books(state, book_id, count=10):
     idx = state.id_to_idx.get(book_id)
     if idx is None:
         return None
-    likes, dislikes, seen, toread = await load_state_from_db()
+    likes, dislikes, seen, toread, read_books = await load_state_from_db()
     source = state.books[idx]
 
     query = state.index.reconstruct(int(idx)).reshape(1, -1).astype("float32")
     faiss.normalize_L2(query)
     D, I = state.index.search(query, 200)
 
-    excluded = likes | dislikes | seen | toread | {book_id}
+    excluded = likes | dislikes | seen | toread | read_books | {book_id}
     pool = []
     for score, nidx in zip(D[0], I[0]):
         nidx = int(nidx)
@@ -918,7 +944,7 @@ async def list_by_action(action: str):
     Returns books from the feedback table, ordered by most recent first.
     Each book is decorated with cover_url and a "why" field.
     """
-    valid_actions = {"like", "dislike", "skip", "toread"}
+    valid_actions = {"like", "dislike", "skip", "toread", "read"}
     if action not in valid_actions:
         return Response(status_code=400, content=json.dumps({"error": "invalid action"}), media_type="application/json")
 
@@ -971,13 +997,14 @@ async def reset_seen():
 @app.get("/api/stats")
 async def stats():
     state = STATE
-    likes, dislikes, seen, toread = await load_state_from_db()
+    likes, dislikes, seen, toread, read_books = await load_state_from_db()
     return {
         "total": len(state.books),
         "liked": len(likes),
         "disliked": len(dislikes),
         "seen": len(seen),
         "toread": len(toread),
+        "read": len(read_books),
     }
 
 
