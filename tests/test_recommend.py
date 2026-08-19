@@ -16,7 +16,7 @@ import numpy as np
 # fastapi/httpx/jinja2. We inject lightweight stubs into sys.modules so that
 # `import main` succeeds without those packages installed.
 
-# faiss stub — provides Kmeans and normalize_L2 (used by _taste_centroids)
+# faiss stub — provides Kmeans and normalize_L2 (used by _taste_centroids_sync)
 class _FakeKmeans:
     def __init__(self, d, k, niter=20, verbose=False, seed=42):
         self.d = d
@@ -85,10 +85,10 @@ from main import (
     _relevance,
     cover_url,
     deterministic_reason,
-    candidate_pool,
-    exploration_pool,
-    diversify,
-    _taste_centroids,
+    _candidate_pool_sync,
+    _exploration_pool_sync,
+    _diversify_sync,
+    _taste_centroids_sync,
     _series_progress,
     _series_boost,
     batch_recommendations,
@@ -169,7 +169,6 @@ class TestEmbedText:
         book = make_book(1, title="Dune", authors=["Frank Herbert"],
                          tags=["Sci-Fi"], description="A desert planet.")
         result = embed_text(book)
-        # title appears twice, tags once (repeated), description once
         assert "Dune" in result
         assert "Sci-Fi" in result
         assert "A desert planet." in result
@@ -177,20 +176,17 @@ class TestEmbedText:
     def test_title_repeated(self):
         book = make_book(1, title="Dune", description="")
         result = embed_text(book)
-        # TITLE_REPEAT = 2, so "Dune" appears twice
         assert result.count("Dune") == 2
 
     def test_tags_repeated(self):
         book = make_book(1, title="X", tags=["Sci-Fi", "Adventure"], description="")
         result = embed_text(book)
-        # TAGS_REPEAT = 2, so the tag string appears twice
         assert result.count("Sci-Fi, Adventure") == 2
 
     def test_description_truncated(self):
         long_desc = " ".join(["word"] * 500)
         book = make_book(1, title="X", description=long_desc)
         result = embed_text(book)
-        # DESCRIPTION_MAX_WORDS = 120, so the description part has 120 words
         desc_part = result.split(" | ")[-1]
         assert len(desc_part.split()) == 120
 
@@ -203,7 +199,6 @@ class TestEmbedText:
         book = make_book(1, title="TitleA", tags=["TagB"], authors=["AuthorC"],
                          description="DescD")
         result = embed_text(book)
-        # Title should appear before tags, authors, description
         assert result.index("TitleA") < result.index("TagB")
         assert result.index("TagB") < result.index("AuthorC")
         assert result.index("AuthorC") < result.index("DescD")
@@ -348,13 +343,11 @@ class TestSeriesProgress:
         assert "Series B" in progress
 
     def test_ignores_toread_and_seen(self):
-        """Only likes should contribute to series progress, not toread/seen."""
         books = [
             make_book(1, series="S", series_index=1.0),
             make_book(2, series="S", series_index=2.0),
         ]
         state = FakeState(books)
-        # Only book 1 is liked — book 2 is toread but not liked
         progress = _series_progress(state, {1})
         assert "S" in progress
         assert 2.0 not in progress["S"]
@@ -376,19 +369,16 @@ class TestSeriesBoost:
         assert _series_boost(book, progress) == SERIES_BOOST
 
     def test_later_liked_not_boosted(self):
-        """If user liked book 3, book 1 should NOT be boosted (only forward)."""
         book = make_book(1, series="Dune", series_index=1.0)
         progress = {"Dune": {3.0}}
         assert _series_boost(book, progress) == 0.0
 
     def test_same_index_not_boosted(self):
-        """Same index (same book) should not boost itself."""
         book = make_book(1, series="Dune", series_index=2.0)
         progress = {"Dune": {2.0}}
         assert _series_boost(book, progress) == 0.0
 
     def test_fractional_index(self):
-        """Fractional indices (novellas between books) should work."""
         book = make_book(1, series="S", series_index=2.5)
         progress = {"S": {2.0}}
         assert _series_boost(book, progress) == SERIES_BOOST
@@ -410,7 +400,7 @@ class TestCandidatePool:
             make_book(3, description="Also has desc"),
         ]
         state = FakeState(books)
-        pool = candidate_pool(state, set(), set(), set(), set(), set(), limit=10, shuffle=False)
+        pool = _candidate_pool_sync(state, set(), set(), set(), set(), set(), limit=10, shuffle=False)
         ids = [b["id"] for b in pool]
         assert 1 in ids
         assert 3 in ids
@@ -423,7 +413,7 @@ class TestCandidatePool:
             make_book(3, title="Omnibus Edition", description="Desc"),
         ]
         state = FakeState(books)
-        pool = candidate_pool(state, set(), set(), set(), set(), set(), limit=10, shuffle=False)
+        pool = _candidate_pool_sync(state, set(), set(), set(), set(), set(), limit=10, shuffle=False)
         ids = [b["id"] for b in pool]
         assert 1 in ids
         assert 2 not in ids
@@ -432,40 +422,37 @@ class TestCandidatePool:
     def test_excludes_seen_dislikes_toread(self):
         books = [make_book(i, description=f"Book {i}") for i in range(1, 11)]
         state = FakeState(books)
-        pool = candidate_pool(
+        pool = _candidate_pool_sync(
             state, likes={1}, dislikes={2}, seen={3}, toread={4}, read_books=set(), limit=10, shuffle=False
         )
         ids = {b["id"] for b in pool}
-        assert 1 not in ids  # liked
-        assert 2 not in ids  # disliked
-        assert 3 not in ids  # seen
-        assert 4 not in ids  # toread
-        # 5-10 should be eligible
+        assert 1 not in ids
+        assert 2 not in ids
+        assert 3 not in ids
+        assert 4 not in ids
         assert ids == {5, 6, 7, 8, 9, 10}
 
     def test_limit_respected(self):
         books = [make_book(i, description=f"Book {i}") for i in range(1, 51)]
         state = FakeState(books)
-        pool = candidate_pool(state, set(), set(), set(), set(), set(), limit=5, shuffle=False)
+        pool = _candidate_pool_sync(state, set(), set(), set(), set(), set(), limit=5, shuffle=False)
         assert len(pool) <= 5
 
     def test_personalized_uses_taste_signal(self):
         books = [make_book(i, description=f"Book {i}") for i in range(1, 21)]
         state = FakeState(books)
-        pool = candidate_pool(state, likes={1}, dislikes=set(), seen=set(), toread=set(), read_books=set(), limit=10, shuffle=False)
+        pool = _candidate_pool_sync(state, likes={1}, dislikes=set(), seen=set(), toread=set(), read_books=set(), limit=10, shuffle=False)
         assert len(pool) > 0
-        # liked book itself should not be in pool
         assert 1 not in {b["id"] for b in pool}
 
     def test_returns_defensive_copies(self):
         books = [make_book(1, description="Book 1")]
         state = FakeState(books)
-        pool = candidate_pool(state, set(), set(), set(), set(), set(), limit=1, shuffle=False)
+        pool = _candidate_pool_sync(state, set(), set(), set(), set(), set(), limit=1, shuffle=False)
         if pool:
             assert pool[0] is not state.books[0]
 
     def test_series_boost_applied(self):
-        """A sequel in a series the user has liked an earlier entry of gets a boost."""
         books = [
             make_book(1, series="Dune", series_index=1.0, description="Book 1"),
             make_book(2, series="Dune", series_index=2.0, description="Book 2"),
@@ -474,7 +461,7 @@ class TestCandidatePool:
             make_book(5, description="Unrelated book 2"),
         ]
         state = FakeState(books)
-        pool = candidate_pool(state, likes={1}, dislikes=set(), seen=set(), toread=set(), read_books=set(), limit=10, shuffle=False)
+        pool = _candidate_pool_sync(state, likes={1}, dislikes=set(), seen=set(), toread=set(), read_books=set(), limit=10, shuffle=False)
         by_id = {b["id"]: b for b in pool}
         if 2 in by_id:
             assert by_id[2]["series_boost"] == SERIES_BOOST
@@ -491,7 +478,7 @@ class TestExplorationPool:
     def test_excludes_all_state(self):
         books = [make_book(i, description=f"Book {i}") for i in range(1, 21)]
         state = FakeState(books)
-        pool = exploration_pool(state, likes={1}, dislikes={2}, seen={3}, toread={4}, read_books=set(), count=5)
+        pool = _exploration_pool_sync(state, likes={1}, dislikes={2}, seen={3}, toread={4}, read_books=set(), count=5)
         ids = {b["id"] for b in pool}
         assert 1 not in ids
         assert 2 not in ids
@@ -501,20 +488,19 @@ class TestExplorationPool:
     def test_count_zero(self):
         books = [make_book(i) for i in range(1, 5)]
         state = FakeState(books)
-        assert exploration_pool(state, set(), set(), set(), set(), set(), 0) == []
+        assert _exploration_pool_sync(state, set(), set(), set(), set(), set(), 0) == []
 
     def test_respects_count(self):
         books = [make_book(i, description=f"Book {i}") for i in range(1, 51)]
         state = FakeState(books)
-        pool = exploration_pool(state, set(), set(), set(), set(), set(), 3)
+        pool = _exploration_pool_sync(state, set(), set(), set(), set(), set(), 3)
         assert len(pool) == 3
 
     def test_randomness(self):
         books = [make_book(i, description=f"Book {i}") for i in range(1, 51)]
         state = FakeState(books)
-        p1 = {b["id"] for b in exploration_pool(state, set(), set(), set(), set(), set(), 5)}
-        p2 = {b["id"] for b in exploration_pool(state, set(), set(), set(), set(), set(), 5)}
-        # Extremely unlikely to get the same 5 random books twice
+        p1 = {b["id"] for b in _exploration_pool_sync(state, set(), set(), set(), set(), set(), 5)}
+        p2 = {b["id"] for b in _exploration_pool_sync(state, set(), set(), set(), set(), set(), 5)}
         assert p1 != p2
 
 
@@ -526,14 +512,14 @@ class TestDiversify:
         books = [make_book(i, description=f"Book {i}") for i in range(1, 4)]
         state = FakeState(books)
         candidates = [dict(b) for b in books]
-        result = diversify(state, candidates, 5)
+        result = _diversify_sync(state, candidates, 5)
         assert len(result) == 3
 
     def test_selects_count(self):
         books = [make_book(i, description=f"Book {i}") for i in range(1, 21)]
         state = FakeState(books)
         candidates = [dict(b, score=0.5) for b in books]
-        result = diversify(state, candidates, 5)
+        result = _diversify_sync(state, candidates, 5)
         assert len(result) == 5
 
     def test_first_pick_is_highest_relevance(self):
@@ -543,14 +529,14 @@ class TestDiversify:
             dict(make_book(1, description="A"), score=0.9),
             dict(make_book(2, description="B"), score=0.3),
         ]
-        result = diversify(state, candidates, 1)
+        result = _diversify_sync(state, candidates, 1)
         assert result[0]["id"] == 1
 
     def test_no_duplicates(self):
         books = [make_book(i, description=f"Book {i}") for i in range(1, 21)]
         state = FakeState(books)
         candidates = [dict(b, score=0.5) for b in books]
-        result = diversify(state, candidates, 5)
+        result = _diversify_sync(state, candidates, 5)
         ids = [b["id"] for b in result]
         assert len(ids) == len(set(ids))
 
@@ -560,36 +546,29 @@ class TestDiversify:
 class TestTasteCentroids:
 
     def test_single_signal_returns_one_centroid(self):
-        """With weight 0.5, duplication produces 1 copy → k=1 → single centroid."""
         books = [make_book(i) for i in range(1, 6)]
         state = FakeState(books)
-        centroids = _taste_centroids(state, [(0, 0.5)])
+        centroids = _taste_centroids_sync(state, [(0, 0.5)])
         assert centroids.shape == (1, state.index.d)
 
     def test_single_like_does_not_overcluster(self):
-        """A single like has weight 1.0 -> 2 duplicated vectors, but there is
-        only 1 distinct signal point, so k must be 1 (not 2, which would ask
-        k-means to split 2 identical vectors into 2 clusters)."""
         books = [make_book(i) for i in range(1, 6)]
         state = FakeState(books)
-        centroids = _taste_centroids(state, [(0, 1.0)])
+        centroids = _taste_centroids_sync(state, [(0, 1.0)])
         assert centroids.shape == (1, state.index.d)
 
     def test_cluster_count_bounded_by_distinct_signal_points(self):
-        """k must be capped by the number of distinct (idx, weight) signal
-        points, not by the duplicated-vector count used for weighting."""
         books = [make_book(i) for i in range(1, 11)]
         state = FakeState(books)
-        # 2 distinct likes -> 4 duplicated vectors, but only 2 distinct tastes
         signal = [(0, 1.0), (1, 1.0)]
-        centroids = _taste_centroids(state, signal, max_clusters=5)
+        centroids = _taste_centroids_sync(state, signal, max_clusters=5)
         assert centroids.shape[0] == 2
 
     def test_multiple_signals_can_produce_multiple_centroids(self):
         books = [make_book(i) for i in range(1, 21)]
         state = FakeState(books)
         signal = [(i, 1.0) for i in range(10)]
-        centroids = _taste_centroids(state, signal, max_clusters=3)
+        centroids = _taste_centroids_sync(state, signal, max_clusters=3)
         assert centroids.shape[0] <= 3
         assert centroids.shape[1] == state.index.d
 
@@ -597,7 +576,7 @@ class TestTasteCentroids:
         books = [make_book(i) for i in range(1, 11)]
         state = FakeState(books)
         signal = [(i, 1.0) for i in range(5)]
-        centroids = _taste_centroids(state, signal)
+        centroids = _taste_centroids_sync(state, signal)
         norms = np.linalg.norm(centroids, axis=1)
         for n in norms:
             assert abs(n - 1.0) < 1e-5
@@ -608,26 +587,22 @@ class TestTasteCentroids:
 class TestBatchRecommendations:
 
     def test_dedup_no_duplicates(self):
-        """The bug that prompted this test: exploitation + exploration can overlap."""
         books = [make_book(i, description=f"Book {i}") for i in range(1, 101)]
         state = FakeState(books)
 
-        # Mock load_state_from_db to return controlled state
         async def fake_load():
-            return set(), set(), set(), set(), set()  # likes, dislikes, seen, toread, read
+            return set(), set(), set(), set(), set()
         main.load_state_from_db = fake_load
 
-        # Mock _decorate_book to just add reason/cover
         async def fake_decorate(state, book, likes, liked_titles, like_sig, similar_to=None):
             book["reason"] = "test"
             book["cover_url"] = ""
             return book
         main._decorate_book = fake_decorate
 
-        # Mock _mark_seen_batch to no-op
-        async def fake_mark(books, likes, dislikes, seen, toread, read_books):
+        async def fake_mark(book, likes, dislikes, seen, toread, read_books):
             pass
-        main._mark_seen_batch = fake_mark
+        main._mark_seen = fake_mark
 
         for _ in range(10):
             result = asyncio.get_event_loop().run_until_complete(
@@ -650,9 +625,9 @@ class TestBatchRecommendations:
             return book
         main._decorate_book = fake_decorate
 
-        async def fake_mark(books, likes, dislikes, seen, toread, read_books):
+        async def fake_mark(book, likes, dislikes, seen, toread, read_books):
             pass
-        main._mark_seen_batch = fake_mark
+        main._mark_seen = fake_mark
 
         result = asyncio.get_event_loop().run_until_complete(
             batch_recommendations(state, count=5)
@@ -661,7 +636,6 @@ class TestBatchRecommendations:
         assert len(result) > 0
 
     def test_exploration_rate_floor(self):
-        """count=10, rate=0.15 → n_explore=1 (floor), not 2 (round)."""
         assert int(10 * 0.15) == 1
 
     def test_empty_library(self):
@@ -677,9 +651,9 @@ class TestBatchRecommendations:
             return book
         main._decorate_book = fake_decorate
 
-        async def fake_mark(books, likes, dislikes, seen, toread, read_books):
+        async def fake_mark(book, likes, dislikes, seen, toread, read_books):
             pass
-        main._mark_seen_batch = fake_mark
+        main._mark_seen = fake_mark
 
         result = asyncio.get_event_loop().run_until_complete(
             batch_recommendations(state, count=10)
@@ -723,7 +697,7 @@ class TestMoreLikeBooks:
         )
         if result:
             ids = {b["id"] for b in result}
-            assert 1 not in ids  # source book excluded
+            assert 1 not in ids
 
 
 # ── run ──────────────────────────────────────────────────────────────────────
