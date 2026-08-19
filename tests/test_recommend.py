@@ -600,9 +600,9 @@ class TestBatchRecommendations:
             return book
         main._decorate_book = fake_decorate
 
-        async def fake_mark(books, likes, dislikes, seen, toread, read_books):
+        async def fake_mark(book, likes, dislikes, seen, toread, read_books):
             pass
-        main._mark_seen_batch = fake_mark
+        main._mark_seen = fake_mark
 
         for _ in range(10):
             result = asyncio.get_event_loop().run_until_complete(
@@ -625,9 +625,9 @@ class TestBatchRecommendations:
             return book
         main._decorate_book = fake_decorate
 
-        async def fake_mark(books, likes, dislikes, seen, toread, read_books):
+        async def fake_mark(book, likes, dislikes, seen, toread, read_books):
             pass
-        main._mark_seen_batch = fake_mark
+        main._mark_seen = fake_mark
 
         result = asyncio.get_event_loop().run_until_complete(
             batch_recommendations(state, count=5)
@@ -651,9 +651,9 @@ class TestBatchRecommendations:
             return book
         main._decorate_book = fake_decorate
 
-        async def fake_mark(books, likes, dislikes, seen, toread, read_books):
+        async def fake_mark(book, likes, dislikes, seen, toread, read_books):
             pass
-        main._mark_seen_batch = fake_mark
+        main._mark_seen = fake_mark
 
         result = asyncio.get_event_loop().run_until_complete(
             batch_recommendations(state, count=10)
