@@ -11,12 +11,19 @@
     .wrap { max-width:1100px; margin:0 auto; }
     h1 { margin:0 0 .2rem; }
     .stats { color:var(--muted); margin-bottom:1.5rem; font-size:.9rem; }
-    .toolbar { display:flex; gap:.5rem; align-items:center; margin-bottom:1rem; }
+    .tabs { display:flex; gap:.3rem; margin-bottom:0; flex-wrap:wrap; }
+    .tab { background:#1a1a1a; color:var(--muted); border:none; border-radius:8px 8px 0 0; padding:.6rem 1.2rem; cursor:pointer; font-size:.9rem; transition:.15s; border-bottom:3px solid transparent; }
+    .tab:hover { color:var(--fg); }
+    .tab.active { color:var(--fg); border-bottom-color:var(--accent); background:var(--card); }
+    .tab .count { font-size:.75rem; color:var(--muted); margin-left:.3rem; }
+    .toolbar { display:flex; gap:.5rem; align-items:center; margin-bottom:1rem; padding-top:1rem; }
     .toolbar button { background:#333; color:var(--fg); border:none; border-radius:8px; padding:.5rem 1rem; cursor:pointer; }
     .toolbar button:hover { background:#444; }
     .toolbar .danger { background:#3a1f1f; color:#ff9b9b; }
     .toolbar .danger:hover { background:#4a2626; }
-    table { width:100%; border-collapse:collapse; background:var(--card); border-radius:12px; overflow:hidden; box-shadow:0 10px 30px rgba(0,0,0,.5); }
+    .loading { text-align:center; padding:3rem; color:var(--muted); }
+    .empty { text-align:center; padding:3rem; color:var(--muted); }
+    table { width:100%; border-collapse:collapse; background:var(--card); border-radius:0 12px 12px 12px; overflow:hidden; box-shadow:0 10px 30px rgba(0,0,0,.5); }
     th, td { padding:.8rem 1rem; text-align:left; vertical-align:top; border-bottom:1px solid #2a2a2a; }
     th { color:var(--muted); font-weight:600; font-size:.85rem; text-transform:uppercase; letter-spacing:.03em; background:#161616; }
     tr:last-child td { border-bottom:none; }
@@ -40,41 +47,126 @@
     .more:hover { background:#26482a; }
     .toread { background:#1f2a3a; color:#8ec5ff; }
     .toread:hover { background:#26364a; }
-    .loading { text-align:center; padding:3rem; color:var(--muted); }
-    .empty { text-align:center; padding:3rem; color:var(--muted); }
+    .have-read { background:#1a3a1a; color:#7fd47f; font-weight:600; }
+    .have-read:hover { background:#244a24; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <h1>BookRec</h1>
     <div class="stats" id="stats">Loading…</div>
-    <div class="toolbar">
-      <button onclick="load()">🔄 New batch</button>
-      <button class="danger" onclick="resetSeen()">↺ Reset seen</button>
-    </div>
-    <div id="app"><div class="loading">Loading recommendations…</div></div>
+    <div class="tabs" id="tabs"></div>
+    <div class="toolbar" id="toolbar"></div>
+    <div id="app"><div class="loading">Loading…</div></div>
   </div>
   <script>
     let currentBooks = [];
-    async function load() {
+    let currentTab = 'recommend';
+    let statsData = { total:0, liked:0, disliked:0, seen:0, toread:0, read:0 };
+
+    const TAB_DEFS = [
+      { id:'recommend', label:'Recommendations', icon:'📚' },
+      { id:'have-read', label:'Have Read', icon:'📖 ✅', action:'read' },
+      { id:'liked', label:'Liked', icon:'👍', action:'like' },
+      { id:'more', label:'More Like This', icon:'🔍' },
+      { id:'toread', label:'To Read', icon:'📖', action:'toread' },
+      { id:'skip', label:'Skipped', icon:'⏭️', action:'skip' },
+      { id:'disliked', label:'Disliked', icon:'👎', action:'dislike' },
+    ];
+
+    function tabCount(action) {
+      if (action === 'like') return statsData.liked;
+      if (action === 'dislike') return statsData.disliked;
+      if (action === 'toread') return statsData.toread;
+      if (action === 'skip') return statsData.seen;
+      if (action === 'read') return statsData.read;
+      return '';
+    }
+
+    function renderTabs() {
+      const el = document.getElementById('tabs');
+      el.innerHTML = TAB_DEFS.map(t => {
+        const c = t.action ? tabCount(t.action) : '';
+        const countHtml = c !== '' ? `<span class="count">(${c})</span>` : '';
+        return `<button class="tab ${t.id === currentTab ? 'active' : ''}" onclick="switchTab('${t.id}')">${t.icon} ${t.label}${countHtml}</button>`;
+      }).join('');
+    }
+
+    function renderToolbar() {
+      const el = document.getElementById('toolbar');
+      if (currentTab === 'recommend') {
+        el.innerHTML = `<button onclick="loadRecommendations()">🔄 New batch</button><button class="danger" onclick="resetSeen()">↺ Reset seen</button>`;
+      } else if (currentTab === 'more') {
+        el.innerHTML = `<span style="color:var(--muted)">Click "More" on a book in Recommendations to see similar books here.</span>`;
+      } else {
+        el.innerHTML = '';
+      }
+    }
+
+    async function switchTab(tab) {
+      currentTab = tab;
+      renderTabs();
+      renderToolbar();
+      const app = document.getElementById('app');
+      app.innerHTML = '<div class="loading">Loading…</div>';
+      currentBooks = [];
+      if (tab === 'recommend') {
+        await loadRecommendations();
+      } else if (tab === 'more') {
+        app.innerHTML = '<div class="empty">Click "More" on a book in Recommendations to see similar books here.</div>';
+      } else {
+        await loadList(tab);
+      }
+    }
+
+    async function loadRecommendations() {
       const app = document.getElementById('app');
       app.innerHTML = '<div class="loading">Loading recommendations…</div>';
       const r = await fetch('/api/recommendations?count=10');
       const data = await r.json();
       if (data.done || !data.books || data.books.length === 0) {
-        currentBooks = [];
         app.innerHTML = '<div class="empty">No more recommendations right now.<br><button onclick="location.reload()">Refresh</button></div>';
         return;
       }
       currentBooks = data.books;
-      renderTable(data.books);
+      renderTable(data.books, true);
     }
-    function renderTable(books) {
+
+    async function loadList(tab) {
+      const action = TAB_DEFS.find(t => t.id === tab)?.action;
+      if (!action) return;
       const app = document.getElementById('app');
+      const label = TAB_DEFS.find(t => t.id === tab).label;
+      app.innerHTML = `<div class="loading">Loading ${label}…</div>`;
+      const r = await fetch(`/api/list/${action}`);
+      if (!r.ok) { app.innerHTML = '<div class="empty">Error loading.</div>'; return; }
+      const data = await r.json();
+      if (!data.books || data.books.length === 0) {
+        app.innerHTML = `<div class="empty">No ${label.toLowerCase()} yet.</div>`;
+        return;
+      }
+      currentBooks = data.books;
+      renderTable(data.books, false);
+    }
+
+    function renderTable(books, showActions) {
+      const app = document.getElementById('app');
+      const headers = showActions
+        ? '<tr><th></th><th>Book</th><th>Why</th><th>About</th><th>Actions</th></tr>'
+        : '<tr><th></th><th>Book</th><th>Why</th><th>About</th><th></th></tr>';
       const rows = books.map(b => {
         const cover = b.cover_url
           ? `<img class="cover" src="${b.cover_url}" alt="cover">`
           : '<div class="no-cover">📖</div>';
+        const acts = showActions ? `
+          <td class="actions">
+            <button class="dislike" onclick="send(${b.id},'dislike')">👎</button>
+            <button class="skip" onclick="send(${b.id},'skip')">Skip</button>
+            <button class="toread" onclick="send(${b.id},'toread')">📚 To Read</button>
+            <button class="have-read" onclick="send(${b.id},'read')">📖 ✅ Have Read</button>
+            <button class="more" onclick="moreLike(${b.id})">More</button>
+            <button class="like" onclick="send(${b.id},'like')">👍</button>
+          </td>` : '<td class="actions"></td>';
         return `
           <tr data-id="${b.id}">
             <td class="cover-cell">${cover}</td>
@@ -82,64 +174,58 @@
               <div class="title">${escapeHtml(b.title)}</div>
               <div class="authors">${escapeHtml((b.authors||[]).join(', ') || 'Unknown author')}</div>
             </td>
-            <td class="reason">${escapeHtml(b.reason)}</td>
+            <td class="reason">${escapeHtml(b.reason || b.why || '')}</td>
             <td class="desc">${escapeHtml(b.description || '')}</td>
-            <td class="actions">
-              <button class="dislike" onclick="send(${b.id},'dislike')">👎</button>
-              <button class="skip" onclick="send(${b.id},'skip')">Skip</button>
-              <button class="toread" onclick="send(${b.id},'toread')">📚 To Read</button>
-              <button class="more" onclick="moreLike(${b.id})">More</button>
-              <button class="like" onclick="send(${b.id},'like')">👍</button>
-            </td>
+            ${acts}
           </tr>`;
       }).join('');
-      app.innerHTML = `
-        <table>
-          <thead>
-            <tr><th></th><th>Book</th><th>Why</th><th>About</th><th>Actions</th></tr>
-          </thead>
-          <tbody>${rows}</tbody>
-        </table>`;
+      app.innerHTML = `<table><thead>${headers}</thead><tbody>${rows}</tbody></table>`;
     }
+
     async function moreLike(bookId) {
+      currentTab = 'more';
+      renderTabs();
+      renderToolbar();
       const app = document.getElementById('app');
       app.innerHTML = '<div class="loading">Finding similar books…</div>';
       const r = await fetch(`/api/more-like/${bookId}?count=10`);
-      if (r.status === 404) {
-        app.innerHTML = '<div class="empty">Book not found.</div>';
-        return;
-      }
+      if (!r.ok) { app.innerHTML = '<div class="empty">Book not found.</div>'; return; }
       const data = await r.json();
       if (data.done || !data.books || data.books.length === 0) {
-        app.innerHTML = '<div class="empty">No similar books found.<br><button onclick="load()">Back to recommendations</button></div>';
+        app.innerHTML = '<div class="empty">No similar books found.<br><button onclick="switchTab(\'recommend\')">Back to recommendations</button></div>';
         return;
       }
       currentBooks = data.books;
-      renderTable(data.books);
+      renderTable(data.books, false);
     }
+
     async function send(bookId, action) {
       const book = currentBooks.find(b => b.id === bookId);
       if (!book) return;
-      // remove the row immediately for snappy UX
       const row = document.querySelector(`tr[data-id="${bookId}"]`);
       if (row) row.remove();
-      await fetch('/api/feedback', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({book_id: bookId, action, reason_shown: book.reason}) });
+      await fetch('/api/feedback', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({book_id: bookId, action, reason_shown: book.reason || book.why || ''}) });
       loadStats();
     }
+
     async function resetSeen() {
-      if (!confirm('Clear your seen history? All books will become eligible for recommendations again.')) return;
+      if (!confirm('Clear your seen history? All books will become eligible again.')) return;
       await fetch('/api/reset-seen', { method:'POST' });
       loadStats();
-      load();
+      if (currentTab === 'recommend') loadRecommendations();
     }
+
     async function loadStats() {
       const r = await fetch('/api/stats');
-      const s = await r.json();
-      document.getElementById('stats').textContent = `${s.total} books · ${s.liked} liked · ${s.disliked} disliked · ${s.toread} to read · ${s.seen} seen`;
+      statsData = await r.json();
+      document.getElementById('stats').textContent = `${statsData.total} books · ${statsData.liked} liked · ${statsData.disliked} disliked · ${statsData.toread} to read · ${statsData.read || 0} read · ${statsData.seen} seen`;
+      renderTabs();
     }
+
     function escapeHtml(t) { return (t||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-    load();
+
     loadStats();
+    loadRecommendations();
   </script>
 </body>
 </html>

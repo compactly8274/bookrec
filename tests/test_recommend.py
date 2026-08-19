@@ -410,7 +410,7 @@ class TestCandidatePool:
             make_book(3, description="Also has desc"),
         ]
         state = FakeState(books)
-        pool = candidate_pool(state, set(), set(), set(), set(), limit=10, shuffle=False)
+        pool = candidate_pool(state, set(), set(), set(), set(), set(), limit=10, shuffle=False)
         ids = [b["id"] for b in pool]
         assert 1 in ids
         assert 3 in ids
@@ -423,7 +423,7 @@ class TestCandidatePool:
             make_book(3, title="Omnibus Edition", description="Desc"),
         ]
         state = FakeState(books)
-        pool = candidate_pool(state, set(), set(), set(), set(), limit=10, shuffle=False)
+        pool = candidate_pool(state, set(), set(), set(), set(), set(), limit=10, shuffle=False)
         ids = [b["id"] for b in pool]
         assert 1 in ids
         assert 2 not in ids
@@ -433,7 +433,7 @@ class TestCandidatePool:
         books = [make_book(i, description=f"Book {i}") for i in range(1, 11)]
         state = FakeState(books)
         pool = candidate_pool(
-            state, likes={1}, dislikes={2}, seen={3}, toread={4}, limit=10, shuffle=False
+            state, likes={1}, dislikes={2}, seen={3}, toread={4}, read_books=set(), limit=10, shuffle=False
         )
         ids = {b["id"] for b in pool}
         assert 1 not in ids  # liked
@@ -446,13 +446,13 @@ class TestCandidatePool:
     def test_limit_respected(self):
         books = [make_book(i, description=f"Book {i}") for i in range(1, 51)]
         state = FakeState(books)
-        pool = candidate_pool(state, set(), set(), set(), set(), limit=5, shuffle=False)
+        pool = candidate_pool(state, set(), set(), set(), set(), set(), limit=5, shuffle=False)
         assert len(pool) <= 5
 
     def test_personalized_uses_taste_signal(self):
         books = [make_book(i, description=f"Book {i}") for i in range(1, 21)]
         state = FakeState(books)
-        pool = candidate_pool(state, likes={1}, dislikes=set(), seen=set(), toread=set(), limit=10, shuffle=False)
+        pool = candidate_pool(state, likes={1}, dislikes=set(), seen=set(), toread=set(), read_books=set(), limit=10, shuffle=False)
         assert len(pool) > 0
         # liked book itself should not be in pool
         assert 1 not in {b["id"] for b in pool}
@@ -460,7 +460,7 @@ class TestCandidatePool:
     def test_returns_defensive_copies(self):
         books = [make_book(1, description="Book 1")]
         state = FakeState(books)
-        pool = candidate_pool(state, set(), set(), set(), set(), limit=1, shuffle=False)
+        pool = candidate_pool(state, set(), set(), set(), set(), set(), limit=1, shuffle=False)
         if pool:
             assert pool[0] is not state.books[0]
 
@@ -474,7 +474,7 @@ class TestCandidatePool:
             make_book(5, description="Unrelated book 2"),
         ]
         state = FakeState(books)
-        pool = candidate_pool(state, likes={1}, dislikes=set(), seen=set(), toread=set(), limit=10, shuffle=False)
+        pool = candidate_pool(state, likes={1}, dislikes=set(), seen=set(), toread=set(), read_books=set(), limit=10, shuffle=False)
         by_id = {b["id"]: b for b in pool}
         if 2 in by_id:
             assert by_id[2]["series_boost"] == SERIES_BOOST
@@ -491,7 +491,7 @@ class TestExplorationPool:
     def test_excludes_all_state(self):
         books = [make_book(i, description=f"Book {i}") for i in range(1, 21)]
         state = FakeState(books)
-        pool = exploration_pool(state, likes={1}, dislikes={2}, seen={3}, toread={4}, count=5)
+        pool = exploration_pool(state, likes={1}, dislikes={2}, seen={3}, toread={4}, read_books=set(), count=5)
         ids = {b["id"] for b in pool}
         assert 1 not in ids
         assert 2 not in ids
@@ -501,19 +501,19 @@ class TestExplorationPool:
     def test_count_zero(self):
         books = [make_book(i) for i in range(1, 5)]
         state = FakeState(books)
-        assert exploration_pool(state, set(), set(), set(), set(), 0) == []
+        assert exploration_pool(state, set(), set(), set(), set(), set(), 0) == []
 
     def test_respects_count(self):
         books = [make_book(i, description=f"Book {i}") for i in range(1, 51)]
         state = FakeState(books)
-        pool = exploration_pool(state, set(), set(), set(), set(), 3)
+        pool = exploration_pool(state, set(), set(), set(), set(), set(), 3)
         assert len(pool) == 3
 
     def test_randomness(self):
         books = [make_book(i, description=f"Book {i}") for i in range(1, 51)]
         state = FakeState(books)
-        p1 = {b["id"] for b in exploration_pool(state, set(), set(), set(), set(), 5)}
-        p2 = {b["id"] for b in exploration_pool(state, set(), set(), set(), set(), 5)}
+        p1 = {b["id"] for b in exploration_pool(state, set(), set(), set(), set(), set(), 5)}
+        p2 = {b["id"] for b in exploration_pool(state, set(), set(), set(), set(), set(), 5)}
         # Extremely unlikely to get the same 5 random books twice
         assert p1 != p2
 
@@ -614,7 +614,7 @@ class TestBatchRecommendations:
 
         # Mock load_state_from_db to return controlled state
         async def fake_load():
-            return set(), set(), set(), set()  # cold start
+            return set(), set(), set(), set(), set()  # likes, dislikes, seen, toread, read
         main.load_state_from_db = fake_load
 
         # Mock _decorate_book to just add reason/cover
@@ -625,7 +625,7 @@ class TestBatchRecommendations:
         main._decorate_book = fake_decorate
 
         # Mock _mark_seen_batch to no-op
-        async def fake_mark(books, likes, dislikes, seen, toread):
+        async def fake_mark(books, likes, dislikes, seen, toread, read_books):
             pass
         main._mark_seen_batch = fake_mark
 
@@ -641,7 +641,7 @@ class TestBatchRecommendations:
         state = FakeState(books)
 
         async def fake_load():
-            return set(), set(), set(), set()
+            return set(), set(), set(), set(), set()
         main.load_state_from_db = fake_load
 
         async def fake_decorate(state, book, likes, liked_titles, like_sig, similar_to=None):
@@ -650,7 +650,7 @@ class TestBatchRecommendations:
             return book
         main._decorate_book = fake_decorate
 
-        async def fake_mark(books, likes, dislikes, seen, toread):
+        async def fake_mark(books, likes, dislikes, seen, toread, read_books):
             pass
         main._mark_seen_batch = fake_mark
 
@@ -668,7 +668,7 @@ class TestBatchRecommendations:
         state = FakeState([])
 
         async def fake_load():
-            return set(), set(), set(), set()
+            return set(), set(), set(), set(), set()
         main.load_state_from_db = fake_load
 
         async def fake_decorate(state, book, likes, liked_titles, like_sig, similar_to=None):
@@ -677,7 +677,7 @@ class TestBatchRecommendations:
             return book
         main._decorate_book = fake_decorate
 
-        async def fake_mark(books, likes, dislikes, seen, toread):
+        async def fake_mark(books, likes, dislikes, seen, toread, read_books):
             pass
         main._mark_seen_batch = fake_mark
 
@@ -696,7 +696,7 @@ class TestMoreLikeBooks:
         state = FakeState(books)
 
         async def fake_load():
-            return set(), set(), set(), set()
+            return set(), set(), set(), set(), set()
         main.load_state_from_db = fake_load
 
         result = asyncio.get_event_loop().run_until_complete(
@@ -709,7 +709,7 @@ class TestMoreLikeBooks:
         state = FakeState(books)
 
         async def fake_load():
-            return set(), set(), set(), set()
+            return set(), set(), set(), set(), set()
         main.load_state_from_db = fake_load
 
         async def fake_decorate(state, book, likes, liked_titles, like_sig, similar_to=None):
