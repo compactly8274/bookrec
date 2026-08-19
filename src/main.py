@@ -507,8 +507,11 @@ def _taste_centroids_sync(state, signal, max_clusters=5):
         for _ in range(copies):
             vecs.append(v)
     vecs = np.vstack(vecs).astype("float32")
-    n = vecs.shape[0]
-    k = min(n, max_clusters)
+    # Cap clusters by DISTINCT signal points, not duplicated vectors.
+    # Weight duplication is only a weighting approximation for k-means;
+    # it must not inflate the cluster count.
+    n_distinct = len({idx for idx, _ in signal})
+    k = min(n_distinct, max_clusters)
     if k <= 1:
         centroid = vecs.mean(axis=0, keepdims=True)
         faiss.normalize_L2(centroid)
