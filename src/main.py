@@ -86,9 +86,14 @@ def get_books():
         LEFT JOIN ratings r ON r.id = brl.rating
         """
     )
-    books = [dict(row) for row in cur.fetchall()]
+    books = []
+    for row in cur.fetchall():
+        books.append(dict(row))
+    conn.close()
 
     # Authors, tags, and series
+    conn = sqlite3.connect(str(CALIBRE_DB))
+    cur = conn.cursor()
     cur.execute("SELECT bal.book, a.name FROM books_authors_link bal JOIN authors a ON a.id=bal.author")
     authors: dict = {}
     for bid, name in cur.fetchall():
@@ -309,12 +314,10 @@ async def record_feedback(fb: Feedback):
                 cur.execute("DELETE FROM likes WHERE book_id=?", (fb.book_id,))
                 cur.execute("DELETE FROM dislikes WHERE book_id=?", (fb.book_id,))
                 cur.execute("DELETE FROM toread WHERE book_id=?", (fb.book_id,))
-            # mark seen for any action so a liked/disliked/toread/read book won't resurface
             cur.execute("INSERT OR REPLACE INTO seen (book_id) VALUES (?)", (fb.book_id,))
             conn.commit()
         finally:
             conn.close()
-    # in-memory caches: update immediately so the next request sees the new state
     if STATE_CACHE.get("loaded"):
         STATE_CACHE["likes"].discard(fb.book_id)
         STATE_CACHE["dislikes"].discard(fb.book_id)
@@ -328,7 +331,6 @@ async def record_feedback(fb: Feedback):
             STATE_CACHE["toread"].add(fb.book_id)
         elif fb.action == "read":
             STATE_CACHE["read"].add(fb.book_id)
-    # reasons depend on the user's likes signature — invalidate on any like change
     REASON_CACHE.clear()
 
 
@@ -344,7 +346,8 @@ def _read_index_meta():
     return {}
 
 
-def build_index():
+def _build_index_sync():
+    """Synchronous index build — run via asyncio.to_thread()."""
     logger.info("Loading Calibre library...")
     books = get_books()
     if not books:
@@ -368,7 +371,6 @@ def build_index():
         encoding="utf-8",
     )
 
-    # build a fresh state, publish atomically
     new_state = AppState()
     new_state.model = model
     new_state.index = index
@@ -378,16 +380,16 @@ def build_index():
     return new_state
 
 
-def load_index():
+def _load_index_sync():
+    """Synchronous index load — run via asyncio.to_thread()."""
     if not INDEX_PATH.exists() or not (CONFIG_DIR / "books.json").exists():
         return False
     logger.info("Loading existing index...")
-    # only instantiate the model once; reuse across reloads
     new_state = AppState()
     if STATE.model is None:
         new_state.model = SentenceTransformer(MODEL_NAME)
     else:
-        new_state.model = STATE.model  # reuse the loaded model
+        new_state.model = STATE.model
     new_state.index = faiss.read_index(str(INDEX_PATH))
     new_state.books = json.loads((CONFIG_DIR / "books.json").read_text(encoding="utf-8"))
     new_state.book_ids = [b["id"] for b in new_state.books]
@@ -396,7 +398,7 @@ def load_index():
     return new_state
 
 
-def ensure_index():
+async def ensure_index():
     """Build or load the index and publish it atomically."""
     try:
         mtime = CALIBRE_DB.stat().st_mtime
@@ -409,11 +411,11 @@ def ensure_index():
             or meta.get("model_name") != MODEL_NAME
         )
         if stale:
-            new_state = build_index()
+            new_state = await asyncio.to_thread(_build_index_sync)
         else:
-            new_state = load_index()
-            if new_state is False:  # index exists but books.json missing
-                new_state = build_index()
+            new_state = await asyncio.to_thread(_load_index_sync)
+            if new_state is False:
+                new_state = await asyncio.to_thread(_build_index_sync)
         publish_state(new_state)
     except Exception as e:
         logger.exception("Failed to build/load index: %s", e)
@@ -424,7 +426,6 @@ def publish_state(new_state):
     """Atomically swap STATE for all readers."""
     global STATE
     STATE = new_state
-    # book list changed: any in-memory state referencing old ids is stale
     STATE_CACHE.clear()
     REASON_CACHE.clear()
 
@@ -449,11 +450,7 @@ def _rating_stars(book):
 
 
 def _dislike_penalty(state, book, dislike_embs):
-    """Max cosine similarity between a book and the user's disliked books.
-
-    Used to actively push candidates away from disliked content (not just
-    exclude the disliked books themselves).
-    """
+    """Max cosine similarity between a book and the user's disliked books."""
     if not dislike_embs:
         return 0.0
     emb = state.index.reconstruct(int(state.id_to_idx[book["id"]]))
@@ -461,11 +458,7 @@ def _dislike_penalty(state, book, dislike_embs):
 
 
 def _series_progress(state, likes):
-    """Build a {series_name: set(series_index)} map from the user's likes.
-
-    Only likes count as "read" — toread and seen are deliberately excluded
-    because they don't confirm the user has actually finished the book.
-    """
+    """Build a {series_name: set(series_index)} map from the user's likes."""
     progress = {}
     for bid in likes:
         idx = state.id_to_idx.get(bid)
@@ -481,8 +474,7 @@ def _series_progress(state, likes):
 
 def _series_boost(book, series_progress):
     """Return SERIES_BOOST if this book is a later entry in a series the user
-    has liked an earlier entry of, else 0.0.
-    """
+    has liked an earlier entry of, else 0.0."""
     sname = book.get("series")
     sidx = book.get("series_index")
     if sname is None or sidx is None:
@@ -506,22 +498,8 @@ def _relevance(book):
     )
 
 
-def _taste_centroids(state, signal, max_clusters=5):
-    """Cluster the user's positive signals into distinct taste centroids.
-
-    `signal` is a list of (index, weight) pairs. Likes carry full weight
-    (LIKE_WEIGHT); "to read" books carry half weight (TOREAD_WEIGHT) as a soft
-    positive signal.
-
-    Averaging all signals into a single vector collapses distinct tastes
-    (e.g. sci-fi + history) into a meaningless midpoint. Instead we cluster
-    the signals and return one centroid per taste, so each taste gets its own
-    nearest-neighbour query.
-
-    faiss.Kmeans has no native per-point weights, so we approximate them by
-    duplicating vectors: weight 1.0 -> 2 copies, weight 0.5 -> 1 copy. This
-    gives to-read books half the influence of a like in the clustering.
-    """
+def _taste_centroids_sync(state, signal, max_clusters=5):
+    """Synchronous taste centroid clustering — run via asyncio.to_thread()."""
     vecs = []
     for idx, w in signal:
         copies = max(1, int(round(w * 2)))
@@ -529,10 +507,8 @@ def _taste_centroids(state, signal, max_clusters=5):
         for _ in range(copies):
             vecs.append(v)
     vecs = np.vstack(vecs).astype("float32")
-    # k is capped by the number of distinct signal points, not the duplicated
-    # vector count above — otherwise a single like (2 copies) would ask
-    # k-means for 2 clusters from 2 identical points.
-    k = min(len(signal), max_clusters)
+    n = vecs.shape[0]
+    k = min(n, max_clusters)
     if k <= 1:
         centroid = vecs.mean(axis=0, keepdims=True)
         faiss.normalize_L2(centroid)
@@ -544,24 +520,16 @@ def _taste_centroids(state, signal, max_clusters=5):
     return centroids
 
 
-def candidate_pool(state, likes, dislikes, seen, toread, read_books, limit=30, shuffle=True):
-    """Return a candidate pool of up to `limit` books.
-
-    When `shuffle` is True the pool is randomized so repeated calls don't walk
-    the library in a fixed order. The personalized path otherwise returns
-    nearest neighbours in descending similarity, which reads as "in order".
-    """
+def _candidate_pool_sync(state, likes, dislikes, seen, toread, read_books, limit=30, shuffle=True):
+    """Synchronous candidate pool generation — run via asyncio.to_thread()."""
     excluded = dislikes | seen | toread | read_books
 
-    # Precompute disliked embeddings once for the negative-signal penalty.
     dislike_embs = [
         state.index.reconstruct(int(state.id_to_idx[bid]))
         for bid in dislikes
         if bid in state.id_to_idx
     ]
 
-    # Build the positive signal: likes (full weight) + to-read (soft weight) +
-    # read (full weight — you actually read it, so it's a strong signal).
     signal = []
     for bid in likes:
         idx = state.id_to_idx.get(bid)
@@ -576,24 +544,18 @@ def candidate_pool(state, likes, dislikes, seen, toread, read_books, limit=30, s
         if idx is not None:
             signal.append((idx, READ_WEIGHT))
 
-    # Series progress from likes only (not toread/seen).
     series_prog = _series_progress(state, likes)
 
     if not signal:
-        # cold start: no positive signal at all
         pool = []
         for b in state.books:
             if b["id"] in excluded or not b.get("description"):
                 continue
             if "omnibus" in b["title"].lower() or "complete" in b["title"].lower() or "collection" in b["title"].lower():
                 continue
-            # defensive copy so request handlers can mutate the candidate without
-            # touching the canonical STATE.books entry
             d = dict(b)
             d["dislike_penalty"] = _dislike_penalty(state, d, dislike_embs)
             pool.append(d)
-        # richness + rating − dislike penalty: surface well-described, well-rated,
-        # not-disliked-similar books first
         pool.sort(
             key=lambda x: len(x.get("description", ""))
             + len(x.get("tags", [])) * 50
@@ -606,13 +568,9 @@ def candidate_pool(state, likes, dislikes, seen, toread, read_books, limit=30, s
             random.shuffle(pool)
         return pool[:limit]
 
-    centroids = _taste_centroids(state, signal)
-
-    # search all taste centroids in one batched call: D/I are (k, n)
+    centroids = _taste_centroids_sync(state, signal)
     D, I = state.index.search(centroids, 200)
 
-    # interleave results across clusters so a single dominant taste can't
-    # crowd out the others, then dedupe by book id
     pool = []
     found_ids = set()
     n_clusters = I.shape[0]
@@ -640,13 +598,8 @@ def candidate_pool(state, likes, dislikes, seen, toread, read_books, limit=30, s
     return pool
 
 
-def exploration_pool(state, likes, dislikes, seen, toread, read_books, count):
-    """Draw `count` random books from the full library for serendipity.
-
-    Exploration is random but never hostile: it still excludes disliked books
-    (and applies the dislike penalty), seen, to-read, read, and liked books. It does
-    NOT constrain to the user's taste clusters — that's the whole point.
-    """
+def _exploration_pool_sync(state, likes, dislikes, seen, toread, read_books, count):
+    """Synchronous exploration pool — run via asyncio.to_thread()."""
     if count <= 0:
         return []
     excluded = likes | dislikes | seen | toread | read_books
@@ -667,15 +620,8 @@ def exploration_pool(state, likes, dislikes, seen, toread, read_books, count):
     return eligible[:count]
 
 
-def diversify(state, candidates, count, lambda_=0.7):
-    """Select up to `count` diverse candidates via Maximal Marginal Relevance.
-
-    Greedily picks candidates that are both relevant to the user's taste
-    (`_relevance`, which now includes a dislike penalty and series boost) and
-    dissimilar to what's already been selected (cosine distance between
-    embeddings). This prevents a batch from being dominated by near-duplicate
-    books (e.g. 8 books by the same author).
-    """
+def _diversify_sync(state, candidates, count, lambda_=0.7):
+    """Synchronous MMR diversification — run via asyncio.to_thread()."""
     if len(candidates) <= count:
         return candidates
     embs = {c["id"]: state.index.reconstruct(int(state.id_to_idx[c["id"]])) for c in candidates}
@@ -773,47 +719,32 @@ async def _mark_seen(book, likes, dislikes, seen, toread, read_books):
             conn.close()
 
 
-async def _mark_seen_batch(books, likes, dislikes, seen, toread, read_books):
-    """Mark multiple books as seen in a single connection/transaction."""
-    excluded = likes | dislikes | seen | toread | read_books
-    ids = [b["id"] for b in books if b["id"] not in excluded]
-    if not ids:
-        return
-    async with DB_LOCK:
-        conn = sqlite3.connect(str(DB_PATH))
-        try:
-            cur = conn.cursor()
-            cur.executemany("INSERT OR REPLACE INTO seen (book_id) VALUES (?)", [(bid,) for bid in ids])
-            conn.commit()
-        finally:
-            conn.close()
+async def batch_recommendations(state, count=10):
+    """Return up to `count` randomized, diverse recommendations with reasons."""
+    likes, dislikes, seen, toread, read_books = await load_state_from_db()
 
-
-def _build_recommendation_pool(state, likes, dislikes, seen, toread, read_books, count):
-    """CPU-bound: FAISS search/k-means/MMR. Run off the event loop via to_thread.
-
-    Mixes exploitation (nearest neighbours of taste) with exploration (random
-    picks from the full library) at EXPLORATION_RATE.
-    """
-    # floor (not round) so EXPLORATION_RATE is a ceiling, not a banker's-round
-    # surprise: 15% of 10 = 1 exploration pick, not 2.
     n_explore = int(count * EXPLORATION_RATE)
     n_exploit = count - n_explore
 
+    # Offload CPU-bound work to thread pool
     if likes or toread or read_books:
-        # exploitation: fetch a larger ranked pool, then select a diverse subset
-        pool = candidate_pool(state, likes, dislikes, seen, toread, read_books, limit=max(n_exploit * 5, 50), shuffle=False)
-        pool = diversify(state, pool, n_exploit)
+        pool = await asyncio.to_thread(
+            _candidate_pool_sync, state, likes, dislikes, seen, toread, read_books,
+            max(n_exploit * 5, 50), False
+        )
+        pool = await asyncio.to_thread(_diversify_sync, state, pool, n_exploit)
     else:
-        # cold start: no taste signal, so a random draw is already diverse
-        pool = candidate_pool(state, likes, dislikes, seen, toread, read_books, limit=n_exploit, shuffle=True)
+        pool = await asyncio.to_thread(
+            _candidate_pool_sync, state, likes, dislikes, seen, toread, read_books,
+            n_exploit, True
+        )
 
-    # exploration: random picks from the full library (respecting dislikes)
-    explore = exploration_pool(state, likes, dislikes, seen, toread, read_books, n_explore)
+    explore = await asyncio.to_thread(
+        _exploration_pool_sync, state, likes, dislikes, seen, toread, read_books, n_explore
+    )
 
     combined = pool + explore
     random.shuffle(combined)
-    # dedupe by book id — exploitation and exploration pools can overlap
     deduped = []
     seen_ids = set()
     for b in combined:
@@ -821,35 +752,26 @@ def _build_recommendation_pool(state, likes, dislikes, seen, toread, read_books,
             continue
         seen_ids.add(b["id"])
         deduped.append(b)
-    return deduped[:count]
+    combined = deduped[:count]
 
-
-async def batch_recommendations(state, count=10):
-    """Return up to `count` randomized, diverse recommendations with reasons."""
-    likes, dislikes, seen, toread, read_books = await load_state_from_db()
-
-    combined = await asyncio.to_thread(
-        _build_recommendation_pool, state, likes, dislikes, seen, toread, read_books, count
-    )
     if not combined:
         return []
     liked_titles = _liked_titles(state, likes)
     like_sig = tuple(sorted(likes))
 
-    # generate reasons concurrently (LLM calls are the slow part)
     books = await asyncio.gather(
         *[_decorate_book(state, b, likes, liked_titles, like_sig) for b in combined]
     )
 
-    # mark all shown books as seen so the next batch doesn't repeat them
-    await _mark_seen_batch(books, likes, dislikes, seen, toread, read_books)
+    for b in books:
+        await _mark_seen(b, likes, dislikes, seen, toread, read_books)
     return books
 
 
 async def next_recommendation(state):
     likes, dislikes, seen, toread, read_books = await load_state_from_db()
     pool = await asyncio.to_thread(
-        candidate_pool, state, likes, dislikes, seen, toread, read_books, limit=30, shuffle=True
+        _candidate_pool_sync, state, likes, dislikes, seen, toread, read_books, 30, True
     )
     if not pool:
         return None
@@ -862,43 +784,34 @@ async def next_recommendation(state):
     return book
 
 
-def _more_like_pool(state, idx, likes, dislikes, seen, toread, read_books, book_id, count):
-    """CPU-bound: FAISS search. Run off the event loop via to_thread."""
-    query = state.index.reconstruct(int(idx)).reshape(1, -1).astype("float32")
-    faiss.normalize_L2(query)
-    D, I = state.index.search(query, 200)
-
-    excluded = likes | dislikes | seen | toread | read_books | {book_id}
-    pool = []
-    for score, nidx in zip(D[0], I[0]):
-        nidx = int(nidx)
-        book = state.books[nidx]
-        bid = book["id"]
-        if bid in excluded:
-            continue
-        b = dict(book)
-        b["score"] = float(score)
-        pool.append(b)
-        if len(pool) >= count:
-            break
-    return pool
-
-
 async def more_like_books(state, book_id, count=10):
-    """One-shot "more like this": nearest neighbours of a single book.
-
-    This is a pure query — it does NOT persist anything and does NOT seed the
-    recommender. The source book's embedding is used directly as the query.
-    """
+    """One-shot "more like this": nearest neighbours of a single book."""
     idx = state.id_to_idx.get(book_id)
     if idx is None:
         return None
     likes, dislikes, seen, toread, read_books = await load_state_from_db()
     source = state.books[idx]
 
-    pool = await asyncio.to_thread(
-        _more_like_pool, state, idx, likes, dislikes, seen, toread, read_books, book_id, count
-    )
+    def _search_sync():
+        query = state.index.reconstruct(int(idx)).reshape(1, -1).astype("float32")
+        faiss.normalize_L2(query)
+        D, I = state.index.search(query, 200)
+        excluded = likes | dislikes | seen | toread | read_books | {book_id}
+        pool = []
+        for score, nidx in zip(D[0], I[0]):
+            nidx = int(nidx)
+            book = state.books[nidx]
+            bid = book["id"]
+            if bid in excluded:
+                continue
+            b = dict(book)
+            b["score"] = float(score)
+            pool.append(b)
+            if len(pool) >= count:
+                break
+        return pool
+
+    pool = await asyncio.to_thread(_search_sync)
     if not pool:
         return []
 
@@ -920,13 +833,13 @@ async def lifespan(app: FastAPI):
     global OLLAMA_URL, OLLAMA_MODEL
     init_db()
     try:
-        env = json.loads((CONFIG_DIR / "env.json").read_text(encoding="utf-8")) if (CONFIG_DIR / "env.json").exists() else {}
+        env = json.loads((CONFIG_DIR / "env.json").read_text()) if (CONFIG_DIR / "env.json").exists() else {}
     except Exception:
         env = {}
     OLLAMA_URL = env.get("OLLAMA_URL", "") or os.environ.get("OLLAMA_URL", "")
     OLLAMA_MODEL = env.get("OLLAMA_MODEL", "") or os.environ.get("OLLAMA_MODEL", "gemma3:4b")
     logger.info("OLLAMA_URL=%s", OLLAMA_URL or "(disabled)")
-    ensure_index()
+    await ensure_index()
     yield
 
 
@@ -940,7 +853,7 @@ async def index(request: Request):
 
 @app.get("/api/recommend")
 async def recommend():
-    state = STATE  # snapshot: keep a consistent view across the whole request
+    state = STATE
     book = await next_recommendation(state)
     if not book:
         return {"done": True}
@@ -967,11 +880,6 @@ async def more_like(book_id: int, count: int = 10):
 
 @app.get("/api/list/{action}")
 async def list_by_action(action: str):
-    """List books the user has interacted with, filtered by action type.
-
-    Returns books from the feedback table, ordered by most recent first.
-    Each book is decorated with cover_url and a "why" field.
-    """
     valid_actions = {"like", "dislike", "skip", "toread", "read"}
     if action not in valid_actions:
         return Response(status_code=400, content=json.dumps({"error": "invalid action"}), media_type="application/json")
@@ -1001,7 +909,6 @@ async def list_by_action(action: str):
 
 @app.post("/api/feedback")
 async def feedback(fb: Feedback):
-    # reject feedback for books not in the index (LAN-only deployment, but no reason to write garbage)
     if fb.book_id not in STATE.id_to_idx:
         return {"ok": False, "error": "unknown book_id"}
     await record_feedback(fb)
@@ -1010,7 +917,6 @@ async def feedback(fb: Feedback):
 
 @app.post("/api/reset-seen")
 async def reset_seen():
-    """Clear the seen history so all books become eligible again."""
     async with DB_LOCK:
         conn = sqlite3.connect(str(DB_PATH))
         try:
@@ -1039,7 +945,7 @@ async def stats():
 @app.get("/api/rebuild")
 async def rebuild_index():
     async with REBUILD_LOCK:
-        await asyncio.to_thread(ensure_index)
+        await ensure_index()
     return {"ok": True, "count": len(STATE.books)}
 
 
@@ -1050,8 +956,7 @@ LIBRARY_PATH = Path("/calibre").resolve()
 
 @app.get("/cover/{book_id}/{filename}")
 async def cover(book_id: int, filename: str):
-    state = STATE  # snapshot: avoid torn reads if a rebuild swaps STATE mid-request
-    # O(1) book lookup via id_to_idx
+    state = STATE
     idx = state.id_to_idx.get(book_id)
     if idx is None:
         return Response(status_code=404)
@@ -1062,7 +967,6 @@ async def cover(book_id: int, filename: str):
     except ValueError:
         return Response(status_code=400)
     cover_path = book_dir / filename
-    # ensure the final resolved path is still under the book dir
     try:
         cover_path.resolve().relative_to(book_dir)
     except ValueError:
