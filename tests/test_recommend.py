@@ -566,6 +566,25 @@ class TestTasteCentroids:
         centroids = _taste_centroids(state, [(0, 0.5)])
         assert centroids.shape == (1, state.index.d)
 
+    def test_single_like_does_not_overcluster(self):
+        """A single like has weight 1.0 -> 2 duplicated vectors, but there is
+        only 1 distinct signal point, so k must be 1 (not 2, which would ask
+        k-means to split 2 identical vectors into 2 clusters)."""
+        books = [make_book(i) for i in range(1, 6)]
+        state = FakeState(books)
+        centroids = _taste_centroids(state, [(0, 1.0)])
+        assert centroids.shape == (1, state.index.d)
+
+    def test_cluster_count_bounded_by_distinct_signal_points(self):
+        """k must be capped by the number of distinct (idx, weight) signal
+        points, not by the duplicated-vector count used for weighting."""
+        books = [make_book(i) for i in range(1, 11)]
+        state = FakeState(books)
+        # 2 distinct likes -> 4 duplicated vectors, but only 2 distinct tastes
+        signal = [(0, 1.0), (1, 1.0)]
+        centroids = _taste_centroids(state, signal, max_clusters=5)
+        assert centroids.shape[0] == 2
+
     def test_multiple_signals_can_produce_multiple_centroids(self):
         books = [make_book(i) for i in range(1, 21)]
         state = FakeState(books)
@@ -605,10 +624,10 @@ class TestBatchRecommendations:
             return book
         main._decorate_book = fake_decorate
 
-        # Mock _mark_seen to no-op
-        async def fake_mark(book, likes, dislikes, seen, toread, read_books):
+        # Mock _mark_seen_batch to no-op
+        async def fake_mark(books, likes, dislikes, seen, toread, read_books):
             pass
-        main._mark_seen = fake_mark
+        main._mark_seen_batch = fake_mark
 
         for _ in range(10):
             result = asyncio.get_event_loop().run_until_complete(
@@ -631,9 +650,9 @@ class TestBatchRecommendations:
             return book
         main._decorate_book = fake_decorate
 
-        async def fake_mark(book, likes, dislikes, seen, toread, read_books):
+        async def fake_mark(books, likes, dislikes, seen, toread, read_books):
             pass
-        main._mark_seen = fake_mark
+        main._mark_seen_batch = fake_mark
 
         result = asyncio.get_event_loop().run_until_complete(
             batch_recommendations(state, count=5)
@@ -658,9 +677,9 @@ class TestBatchRecommendations:
             return book
         main._decorate_book = fake_decorate
 
-        async def fake_mark(book, likes, dislikes, seen, toread, read_books):
+        async def fake_mark(books, likes, dislikes, seen, toread, read_books):
             pass
-        main._mark_seen = fake_mark
+        main._mark_seen_batch = fake_mark
 
         result = asyncio.get_event_loop().run_until_complete(
             batch_recommendations(state, count=10)
