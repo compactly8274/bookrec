@@ -71,11 +71,19 @@
       { id:'disliked', label:'Disliked', icon:'👎', action:'dislike' },
     ];
 
+    function tabCount(action) {
+      if (action === 'like') return statsData.liked;
+      if (action === 'dislike') return statsData.disliked;
+      if (action === 'toread') return statsData.toread;
+      if (action === 'skip') return statsData.seen;
+      return '';
+    }
+
     function renderTabs() {
       const el = document.getElementById('tabs');
       el.innerHTML = TAB_DEFS.map(t => {
-        const count = t.action ? (t.action === 'like' ? statsData.liked : t.action === 'dislike' ? statsData.disliked : t.action === 'toread' ? statsData.toread : t.action === 'skip' ? statsData.seen : 0) : '';
-        const countHtml = count !== '' ? `<span class="count">(${count})</span>` : '';
+        const c = t.action ? tabCount(t.action) : '';
+        const countHtml = c !== '' ? `<span class="count">(${c})</span>` : '';
         return `<button class="tab ${t.id === currentTab ? 'active' : ''}" onclick="switchTab('${t.id}')">${t.icon} ${t.label}${countHtml}</button>`;
       }).join('');
     }
@@ -124,12 +132,13 @@
       const action = TAB_DEFS.find(t => t.id === tab)?.action;
       if (!action) return;
       const app = document.getElementById('app');
-      app.innerHTML = `<div class="loading">Loading ${TAB_DEFS.find(t=>t.id===tab).label}…</div>`;
+      const label = TAB_DEFS.find(t => t.id === tab).label;
+      app.innerHTML = `<div class="loading">Loading ${label}…</div>`;
       const r = await fetch(`/api/list/${action}`);
       if (!r.ok) { app.innerHTML = '<div class="empty">Error loading.</div>'; return; }
       const data = await r.json();
       if (!data.books || data.books.length === 0) {
-        app.innerHTML = `<div class="empty">No ${TAB_DEFS.find(t=>t.id===tab).label.toLowerCase()} yet.</div>`;
+        app.innerHTML = `<div class="empty">No ${label.toLowerCase()} yet.</div>`;
         return;
       }
       currentBooks = data.books;
@@ -138,14 +147,9 @@
 
     function renderTable(books, showActions) {
       const app = document.getElementById('app');
-      const actions = showActions ? `
-        <td class="actions">
-          <button class="dislike" onclick="send(${0},'dislike')">👎</button>
-          <button class="skip" onclick="send(${0},'skip')">Skip</button>
-          <button class="toread" onclick="send(${0},'toread')">📚 To Read</button>
-          <button class="more" onclick="moreLike(${0})">More</button>
-          <button class="like" onclick="send(${0},'like')">👍</button>
-        </td>` : '<td class="actions"></td>';
+      const headers = showActions
+        ? '<tr><th></th><th>Book</th><th>Why</th><th>About</th><th>Actions</th></tr>'
+        : '<tr><th></th><th>Book</th><th>Why</th><th>About</th><th></th></tr>';
       const rows = books.map(b => {
         const cover = b.cover_url
           ? `<img class="cover" src="${b.cover_url}" alt="cover">`
@@ -170,9 +174,6 @@
             ${acts}
           </tr>`;
       }).join('');
-      const headers = showActions
-        ? '<tr><th></th><th>Book</th><th>Why</th><th>About</th><th>Actions</th></tr>'
-        : '<tr><th></th><th>Book</th><th>Why</th><th>About</th><th></th></tr>';
       app.innerHTML = `<table><thead>${headers}</thead><tbody>${rows}</tbody></table>`;
     }
 
