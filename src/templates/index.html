@@ -10,7 +10,7 @@
     body { margin:0; font-family: system-ui, -apple-system, sans-serif; background:var(--bg); color:var(--fg); min-height:100vh; padding:2rem 1rem; }
     .wrap { max-width:1100px; margin:0 auto; }
     h1 { margin:0 0 .2rem; }
-    .stats { color:var(--muted); margin-bottom:1rem; font-size:.9rem; }
+    .stats { color:var(--muted); margin-bottom:1.5rem; font-size:.9rem; }
     .tabs { display:flex; gap:.3rem; margin-bottom:0; flex-wrap:wrap; }
     .tab { background:#1a1a1a; color:var(--muted); border:none; border-radius:8px 8px 0 0; padding:.6rem 1.2rem; cursor:pointer; font-size:.9rem; transition:.15s; border-bottom:3px solid transparent; }
     .tab:hover { color:var(--fg); }
@@ -93,7 +93,7 @@
       if (currentTab === 'recommend') {
         el.innerHTML = `<button onclick="loadRecommendations()">🔄 New batch</button><button class="danger" onclick="resetSeen()">↺ Reset seen</button>`;
       } else if (currentTab === 'more') {
-        el.innerHTML = `<span style="color:var(--muted)">Click "More" on any recommendation to see similar books here.</span>`;
+        el.innerHTML = `<span style="color:var(--muted)">Click "More" on a book in Recommendations to see similar books here.</span>`;
       } else {
         el.innerHTML = '';
       }
