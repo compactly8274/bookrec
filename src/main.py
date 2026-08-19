@@ -86,14 +86,9 @@ def get_books():
         LEFT JOIN ratings r ON r.id = brl.rating
         """
     )
-    books = []
-    for row in cur.fetchall():
-        books.append(dict(row))
-    conn.close()
+    books = [dict(row) for row in cur.fetchall()]
 
     # Authors, tags, and series
-    conn = sqlite3.connect(str(CALIBRE_DB))
-    cur = conn.cursor()
     cur.execute("SELECT bal.book, a.name FROM books_authors_link bal JOIN authors a ON a.id=bal.author")
     authors: dict = {}
     for bid, name in cur.fetchall():
@@ -722,6 +717,33 @@ async def _mark_seen(book, likes, dislikes, seen, toread, read_books):
             conn.close()
 
 
+async def _mark_seen_batch(books, likes, dislikes, seen, toread, read_books):
+    """Mark multiple books as seen in a single connection/transaction."""
+    excluded = likes | dislikes | seen | toread | read_books
+    ids = [b["id"] for b in books if b["id"] not in excluded]
+    if not ids:
+        return
+    async with DB_LOCK:
+        conn = sqlite3.connect(str(DB_PATH))
+        try:
+            cur = conn.cursor()
+            cur.executemany("INSERT OR REPLACE INTO seen (book_id) VALUES (?)", [(bid,) for bid in ids])
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _exploit_pool_sync(state, likes, dislikes, seen, toread, read_books, n_exploit):
+    """Synchronous exploitation pool: candidate_pool, plus MMR diversify once
+    there's a taste signal to diversify against. Run via asyncio.to_thread()."""
+    if likes or toread or read_books:
+        pool = _candidate_pool_sync(
+            state, likes, dislikes, seen, toread, read_books, max(n_exploit * 5, 50), False
+        )
+        return _diversify_sync(state, pool, n_exploit)
+    return _candidate_pool_sync(state, likes, dislikes, seen, toread, read_books, n_exploit, True)
+
+
 async def batch_recommendations(state, count=10):
     """Return up to `count` randomized, diverse recommendations with reasons."""
     likes, dislikes, seen, toread, read_books = await load_state_from_db()
@@ -729,21 +751,11 @@ async def batch_recommendations(state, count=10):
     n_explore = int(count * EXPLORATION_RATE)
     n_exploit = count - n_explore
 
-    # Offload CPU-bound work to thread pool
-    if likes or toread or read_books:
-        pool = await asyncio.to_thread(
-            _candidate_pool_sync, state, likes, dislikes, seen, toread, read_books,
-            max(n_exploit * 5, 50), False
-        )
-        pool = await asyncio.to_thread(_diversify_sync, state, pool, n_exploit)
-    else:
-        pool = await asyncio.to_thread(
-            _candidate_pool_sync, state, likes, dislikes, seen, toread, read_books,
-            n_exploit, True
-        )
-
-    explore = await asyncio.to_thread(
-        _exploration_pool_sync, state, likes, dislikes, seen, toread, read_books, n_explore
+    # Exploitation and exploration are independent of each other, so run them
+    # concurrently in the thread pool instead of as sequential thread hops.
+    pool, explore = await asyncio.gather(
+        asyncio.to_thread(_exploit_pool_sync, state, likes, dislikes, seen, toread, read_books, n_exploit),
+        asyncio.to_thread(_exploration_pool_sync, state, likes, dislikes, seen, toread, read_books, n_explore),
     )
 
     combined = pool + explore
@@ -766,8 +778,7 @@ async def batch_recommendations(state, count=10):
         *[_decorate_book(state, b, likes, liked_titles, like_sig) for b in combined]
     )
 
-    for b in books:
-        await _mark_seen(b, likes, dislikes, seen, toread, read_books)
+    await _mark_seen_batch(books, likes, dislikes, seen, toread, read_books)
     return books
 
 
@@ -836,7 +847,7 @@ async def lifespan(app: FastAPI):
     global OLLAMA_URL, OLLAMA_MODEL
     init_db()
     try:
-        env = json.loads((CONFIG_DIR / "env.json").read_text()) if (CONFIG_DIR / "env.json").exists() else {}
+        env = json.loads((CONFIG_DIR / "env.json").read_text(encoding="utf-8")) if (CONFIG_DIR / "env.json").exists() else {}
     except Exception:
         env = {}
     OLLAMA_URL = env.get("OLLAMA_URL", "") or os.environ.get("OLLAMA_URL", "")
